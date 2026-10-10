@@ -1,0 +1,35 @@
+{
+ "reference": {
+  "now": "2026-10-01T12:00:00+00:00",
+  "tags": {"valencia": [-1001700000001, -1001700000002, -1001700000003], "madrid": [-1001700000004]},
+  "seeded": [
+   "https://t.me/rus_valencia/2", "https://t.me/rus_valencia/4",
+   "https://t.me/avisos_vlc/1", "https://t.me/c/1700000003/1"
+  ],
+  "excluded": ["https://t.me/rus_valencia/1", "https://t.me/rus_madrid/1"],
+  "unrelated": ["https://t.me/rus_valencia/3", "https://t.me/avisos_vlc/2", "https://t.me/c/1700000003/2"]
+ },
+ "chats": [
+  {"chat_id": -1001700000001, "title": "Русские в Валенсии", "kind": "supergroup", "username": "rus_valencia",
+   "messages": [
+    {"id": 1, "date": "2026-07-20T09:00:00+00:00", "text": "Продление ВНЖ в Валенсии: в прошлом году ждали два месяца", "sender_id": 11, "sender_name": "Оля"},
+    {"id": 2, "date": "2026-09-20T09:00:00+00:00", "text": "Кто знает, сколько сейчас занимает продление ВНЖ в Валенсии?", "sender_id": 12, "sender_name": "Дима"},
+    {"id": 3, "date": "2026-09-20T15:00:00+00:00", "text": "Кто идёт на паэлью в субботу?", "sender_id": 11, "sender_name": "Оля"},
+    {"id": 4, "date": "2026-09-25T10:00:00+00:00", "text": "Подала на renovación ВНЖ через cita previa, жду ответа", "sender_id": 13, "sender_name": "Катя"}
+   ]},
+  {"chat_id": -1001700000002, "title": "Avisos Valencia", "kind": "channel", "username": "avisos_vlc",
+   "messages": [
+    {"id": 1, "date": "2026-09-22T08:00:00+00:00", "text": "Ya se puede pedir cita para la renovación de la TIE por internet", "sender_name": "Avisos"},
+    {"id": 2, "date": "2026-09-23T18:00:00+00:00", "text": "Corte de agua en el barrio del Carmen el jueves", "sender_name": "Avisos"}
+   ]},
+  {"chat_id": -1001700000003, "title": "Valencia Expats", "kind": "supergroup",
+   "messages": [
+    {"id": 1, "date": "2026-09-24T10:00:00+00:00", "text": "Any tips on residence permit renewal at the Valencia office?", "sender_id": 21, "sender_name": "Sam"},
+    {"id": 2, "date": "2026-09-26T19:00:00+00:00", "text": "Lost my keys near Malvarrosa beach, anyone found them?", "sender_id": 22, "sender_name": "Jo"}
+   ]},
+  {"chat_id": -1001700000004, "title": "Русские в Мадриде", "kind": "supergroup", "username": "rus_madrid",
+   "messages": [
+    {"id": 1, "date": "2026-09-21T10:00:00+00:00", "text": "Продление ВНЖ в Мадриде: очередь на месяц", "sender_id": 31, "sender_name": "Лена"}
+   ]}
+ ]
+}

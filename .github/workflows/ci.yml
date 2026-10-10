@@ -1,0 +1,41 @@
+# Mirrors `make ci`. Actions are disabled on this repo (owner decision); the workflow is
+# kept valid by actionlint in `make ci`, and the local run is the CI evidence.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: tgi
+          POSTGRES_DB: tgi
+          # Throwaway password for an ephemeral service container reachable only from this job.
+          POSTGRES_PASSWORD: ci-ephemeral
+          POSTGRES_INITDB_ARGS: --locale=en_US.utf8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tgi -d tgi"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql://tgi:ci-ephemeral@127.0.0.1:5432/tgi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest

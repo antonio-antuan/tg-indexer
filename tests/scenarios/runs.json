@@ -1,0 +1,20 @@
+{
+ "chats": [
+  {"chat_id": -1001000000003, "title": "Valencia", "kind": "supergroup", "username": "vlc",
+   "messages": [
+    {"id": 1, "date": "2026-09-01T08:00:00+00:00", "text": "Продление ВНЖ в Валенсии", "sender_id": 1, "sender_name": "Ann"},
+    {"id": 2, "date": "2026-09-01T08:01:00+00:00", "text": "renovación TIE", "sender_id": 2, "sender_name": "Bea", "reply_to": 1},
+    {"id": 3, "date": "2026-09-01T08:02:00+00:00", "text": "residence permit renewal", "sender_id": 3, "sender_name": "Cal"}
+   ]},
+  {"chat_id": 4200, "title": "Private", "kind": "private",
+   "messages": [
+    {"id": 1, "date": "2026-09-01T09:00:00+00:00", "text": "hola"}
+   ]}
+ ],
+ "runs": [
+  {"add": [{"chat_id": -1001000000003, "id": 4, "date": "2026-09-02T08:00:00+00:00", "text": "new one"}],
+   "edit": [{"chat_id": -1001000000003, "id": 2, "text": "renovación TIE (editado)", "edit_date": "2026-09-02T08:30:00+00:00"}],
+   "delete": [{"chat_id": -1001000000003, "id": 3}],
+   "faults": [{"call": 1, "flood_wait": 5}]}
+ ]
+}

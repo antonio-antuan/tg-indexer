@@ -1,0 +1,23 @@
+# tgi MCP server as a systemd user unit (SPEC §5.6). A template: it assumes the checkout at
+# ~/tg-indexer with `uv sync` done, and .env at ~/.config/tgi/.env (mode 0600).
+#   install -Dm644 deploy/tgi-mcp.service ~/.config/systemd/user/tgi-mcp.service
+#   systemctl --user daemon-reload && systemctl --user enable --now tgi-mcp
+# The server refuses MCP_BIND addresses that are neither loopback nor on a docker*/br-*
+# interface; Restart=on-failure retries while Docker's network is not up yet.
+
+[Unit]
+Description=tg-indexer MCP server (tgi mcp --http)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/tg-indexer
+EnvironmentFile=%h/.config/tgi/.env
+ExecStart=%h/tg-indexer/.venv/bin/tgi mcp --http
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

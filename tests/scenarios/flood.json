@@ -1,0 +1,15 @@
+{
+ "chats": [
+  {"chat_id": -1001000000002, "title": "Flood", "kind": "channel", "username": null,
+   "messages": [
+    {"id": 1, "date": "2026-09-01T08:00:00+00:00", "text": "uno"},
+    {"id": 2, "date": "2026-09-01T08:05:00+00:00", "text": "dos"},
+    {"id": 3, "date": "2026-09-01T08:10:00+00:00", "text": "tres"}
+   ]}
+ ],
+ "faults": [
+  {"call": 1, "flood_wait": 2},
+  {"call": 2, "flood_wait": 2},
+  {"call": 4, "error": "connection lost"}
+ ]
+}
