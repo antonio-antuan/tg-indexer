@@ -364,7 +364,10 @@ Any MCP client works; `docs/AGENT-NOTES.md` is the guidance to give the agent.
         prompts: false
   ```
 
-  Select it with `--toolsets tgi`. Give a chat-facing assistant the tgi tools without a shell
+  Select it with `--toolsets tgi`. Check that the client honours the annotations: Hermes
+  v0.21.5 (MCP SDK 2.0) does not read `readOnlyHint` and asks before every tool on an
+  `untrusted` server. With such a client use the default `trust`, leave `add_chat` out of
+  `include` and add chats with `tgi chats add`. Give a chat-facing assistant the tgi tools without a shell
   where you can: a shell can read `.env` and the TDLib session, which MCP does not expose.
 
 ## Operations

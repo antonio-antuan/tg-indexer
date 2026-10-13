@@ -644,9 +644,9 @@ def build_server(
         exact range covered (UTC), `hits` (score has no meaning here) and `next_cursor`.
         For the next page call recent(cursor=<next_cursor>): the cursor keeps the range,
         filters and `compact`, so other arguments but `limit` are ignored. Continue until
-        `next_cursor` is null, even after a short or empty page. `compact=true` cuts long texts
-        (`truncated`). Use for digests and "what happened in these chats"; use `search` for
-        a topic."""
+        `next_cursor` is null, even after a short or empty page. `limit` is at most 50
+        (default 20); `compact=true` cuts long texts (`truncated`). Use for digests and "what
+        happened in these chats"; use `search` for a topic."""
         return connected(
             lambda conn: run_recent(
                 conn, tags, chat_ids, hours, since, until, limit, cursor, compact=compact
