@@ -142,6 +142,18 @@ def _tdlib_errors(what: str) -> Iterator[None]:
         raise typer.Exit(3) from None
 
 
+@contextmanager
+def _sync_lock_or_exit(conn: Any, what: str) -> Iterator[None]:
+    """Hold the sync lock while a command uses an account's TDLib session, which a running
+    `tgi sync` holds too; exit 2 when it is taken, as `sync` does."""
+    try:
+        with ingest.sync_lock(conn):
+            yield
+    except ingest.SyncLocked:
+        typer.echo(f"{what}: a tgi sync, embed, purge or forget is running; try again", err=True)
+        raise typer.Exit(2) from None
+
+
 # Supergroup ids are negative (-100…); without this click reads them as unknown options.
 _CHAT_ID_ARGS = {"ignore_unknown_options": True}
 
@@ -170,7 +182,7 @@ def sync_command(
             try:
                 result = ingest.sync(
                     conn, clients, settings, max_minutes=max_minutes, resweep=resweep,
-                    embedder=embedder,
+                    embedder=embedder, close_clients=clients.close,
                 )  # fmt: skip
             except ingest.SyncLocked as exc:
                 typer.echo(str(exc), err=True)
@@ -288,14 +300,15 @@ _ACCOUNT = typer.Option(..., "--account", help="Account phone, e.g. +34...")
 
 @chats_app.command("list")
 def chats_list(account: str = _ACCOUNT, scenario: Path | None = _SCENARIO) -> None:
-    """Show the account's dialogs; '*' marks enabled chats."""
-    clients = _Clients(scenario)
-    try:
-        with _tdlib_errors("chats list"):
-            dialogs = clients(account).get_chats()
-    finally:
-        clients.close()
+    """Show the account's dialogs; '*' marks enabled chats. Exit 2 while a sync runs."""
     with db.connect(_database_url()) as conn:
+        with _sync_lock_or_exit(conn, "chats list"):
+            clients = _Clients(scenario)
+            try:
+                with _tdlib_errors("chats list"):
+                    dialogs = clients(account).get_chats()
+            finally:
+                clients.close()
         enabled = chats.enabled_ids(conn, account)
     for chat in dialogs:
         mark = "*" if chat.chat_id in enabled else " "
@@ -309,20 +322,21 @@ def chats_enable(
     years: int | None = typer.Option(None, "--years", help="Backfill lookback."),
     scenario: Path | None = _SCENARIO,
 ) -> None:
-    """Add a chat to the allowlist."""
+    """Add a chat to the allowlist. Exit 2 while a sync runs."""
     try:  # before TDLib is opened or anything is written
         if years is not None:
             check_years(years)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--years") from None
     default_years = _settings().backfill_years
-    clients = _Clients(scenario)
-    try:
-        with _tdlib_errors("chats enable"):
-            chat = clients(account).get_chat(chat_id)
-    finally:
-        clients.close()
     with db.connect(_database_url()) as conn:
+        with _sync_lock_or_exit(conn, "chats enable"):
+            clients = _Clients(scenario)
+            try:
+                with _tdlib_errors("chats enable"):
+                    chat = clients(account).get_chat(chat_id)
+            finally:
+                clients.close()
         try:
             depth = chats.enable(conn, chat, account, years, default_years=default_years)
         except chats.ChatConflict as exc:

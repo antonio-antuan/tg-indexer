@@ -51,7 +51,9 @@ command stops (exit 1) before it creates a client.
 `tgi` does not read `.env` itself, but every command warns on stderr when the `.env` in the
 current directory is more open than 0600 (the line names the file and its mode only).
 A TDLib error in `tgi chats list` or `tgi chats enable` exits 3 with the error type and
-code, as `sync` does. `tgi chats add` takes the same links as the MCP `add_chat` tool and
+code, as `sync` does. Both use the account's TDLib session, which a running sync holds, so
+they connect to the database first, take the sync lock and exit 2 while a sync, `embed`,
+`purge` or `forget` runs. `tgi chats add` takes the same links as the MCP `add_chat` tool and
 refuses the same chats: a private chat, a basic group, a chat enabled under another account,
 a link that sends a join request (run it again once approved) or leads nowhere all exit 1
 with nothing enabled; it exits 2 while a sync (or `embed`, `purge`, `forget`) holds the lock,
@@ -78,6 +80,27 @@ error or a `--resweep-days` chat that is not in the archive, and 3 when the run 
 `error`, printing only the error type (the run is recorded as `error` in `sync_run`);
 progress is checkpointed per page either way. A run killed before it could
 record its end leaves its row `running`; the next run marks it `interrupted`.
+
+The budget is shared out so a long history cannot starve the rest: catch-up (new messages)
+runs first with the whole budget, the backfill stops at 80% of it (`BACKFILL_RESERVE`), and the
+sweep, the window step and embedding get the rest: at most about a fifth of the budget for
+them together, less (or nothing) when catch-up itself runs long. A Telegram flood wait the
+backfill could not wait out is still honoured: the sweep waits for it within the budget or the
+run ends. A run whose backfill stopped there ends
+`time_limited` and continues the backfill next run. The budget is soft: the window step has no
+deadline and embedding checks it between batches. TDLib is closed before the run releases
+the lock, so a command waiting for the lock never meets a session that is still closing.
+
+### Running the sync on a timer
+
+`deploy/tgi-sync.service` and `deploy/tgi-sync.timer` are systemd user unit templates (the
+install commands are in the service's header): `tgi sync --max-minutes 150` every 3 hours,
+catching up a missed run at the next start. Exit 2 (the lock was held) counts as a skipped run,
+not a failure. Like the MCP unit they read `~/.config/tgi/.env`, where systemd expands neither
+`${…}` nor `~`: write `DATABASE_URL` with the password itself and absolute paths. For fresher
+answers run it more often with a smaller budget (the timer's header has an hourly example) and
+set `SYNC_EVERY_MINUTES` to match. `systemctl --user list-timers` shows the next run;
+`journalctl --user -u tgi-sync` the printed status and stats.
 
 The sweep re-pages the last `SWEEP_DAYS` (7) days of each chat: edits are applied, and
 messages missing from a fully paged range are tombstoned (`ON_DELETE=tombstone`, hidden

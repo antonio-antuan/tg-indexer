@@ -28,6 +28,9 @@ PAGE_LIMIT = 100
 # `tgi sync --max-minutes` default: a run's time budget.
 DEFAULT_MAX_MINUTES = 150
 MAX_FLOOD_WAITS = 3
+# Share of a run's budget kept from the backfill, so the sweep and the embed step still run
+# while a long history is being fetched (it would otherwise use the whole budget).
+BACKFILL_RESERVE = 0.2
 # Arbitrary constant, distinct from the migration lock; one `tgi sync` at a time.
 SYNC_LOCK_KEY = 0x7467_6931
 
@@ -162,15 +165,25 @@ class _Run:
     settings: Settings
     clock: Clock
     deadline: float
+    # The backfill stops here, before `deadline` (BACKFILL_RESERVE); None: at `deadline`.
+    backfill_deadline: float | None = None
     stats: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STAT_KEYS, 0))
+    # The deadline the current step pages against: `deadline`, or `backfill_deadline`.
+    _limit: float | None = None
     _floods: int = 0
     _last_request: dict[str, float] = field(default_factory=dict)
+    # Per account, when Telegram's last flood wait ends: a step that could not wait it out
+    # (the backfill's deadline) must not let the next step ask again before then.
+    _cooldown: dict[str, float] = field(default_factory=dict)
 
     # --- TDLib paging -------------------------------------------------------------------
 
+    def _step_deadline(self) -> float:
+        return self.deadline if self._limit is None else self._limit
+
     def _sleep(self, seconds: float) -> None:
-        """Sleep within the budget; a wait that would reach the deadline ends the run now."""
-        if self.clock.monotonic() + seconds >= self.deadline:
+        """Sleep within the budget; a wait that would reach the deadline ends the step now."""
+        if self.clock.monotonic() + seconds >= self._step_deadline():
             raise _Stop("time_limited")
         self.clock.sleep(seconds)
 
@@ -178,10 +191,14 @@ class _Run:
         client = self.client_for(chat.account_phone)
         delay = self.settings.page_delay_ms / 1000
         while True:
-            if self.clock.monotonic() >= self.deadline:
+            if self.clock.monotonic() >= self._step_deadline():
                 raise _Stop("time_limited")
             last = self._last_request.get(chat.account_phone)
-            if last is not None and (wait := last + delay - self.clock.monotonic()) > 0:
+            ready = max(
+                last + delay if last is not None else 0.0,
+                self._cooldown.get(chat.account_phone, 0.0),
+            )
+            if (wait := ready - self.clock.monotonic()) > 0:
                 self._sleep(wait)
             self._last_request[chat.account_phone] = self.clock.monotonic()
             self.stats["requests"] += 1
@@ -196,6 +213,7 @@ class _Run:
                     exc.retry_after,
                     self._floods,
                 )
+                self._cooldown[chat.account_phone] = self.clock.monotonic() + exc.retry_after
                 if self._floods >= MAX_FLOOD_WAITS:
                     raise _Stop("flood_limited") from None
                 self._sleep(exc.retry_after)
@@ -520,13 +538,26 @@ class _Run:
                     (chat.chat_id,),
                 )
         pending = [c for c in chats if not c.backfill_done and c.oldest is not None]
-        while pending:
-            for chat in pending:
-                self.backfill_page(chat)
-            pending = [c for c in pending if not c.backfill_done]
+        backfill_cut = False
+        self._limit = self.backfill_deadline
+        try:
+            while pending:
+                for chat in pending:
+                    self.backfill_page(chat)
+                pending = [c for c in pending if not c.backfill_done]
+        except _Stop as stop:
+            # The backfill's own deadline (or the run's) passed: the sweep still gets the
+            # reserved part of the budget; a flood limit ends the run as before.
+            if stop.status != "time_limited":
+                raise
+            backfill_cut = True
+        finally:
+            self._limit = None
         for chat in chats:
             if chat.newest is not None:
                 self.sweep(chat, self.settings.sweep_days)
+        if backfill_cut:
+            raise _Stop("time_limited")
 
 
 def sync(
@@ -537,11 +568,16 @@ def sync(
     max_minutes: float = DEFAULT_MAX_MINUTES,
     resweep: tuple[int, int] | None = None,
     embedder: embed.Embedder | None = None,
+    close_clients: Callable[[], None] | None = None,
 ) -> SyncResult:
     """One `tgi sync` run over all enabled chats; `client_for(account_phone)` gives clients.
 
     `resweep=(chat_id, days)` runs only that chat's sweep over the last `days` days.
     `embedder` defaults to the configured provider (`embed.provider(settings)`).
+    `close_clients` is called once the TDLib steps are over, still under the lock, so a
+    command that waits for the lock (`add_chat`, `tgi chats …`) never meets a TDLib session
+    that is still closing. If it raises, the run is recorded `error` with the stats so far,
+    the window and embed steps are skipped, and its exception propagates.
 
     Raises `SyncLocked` if another run holds the lock. Errors other than flood limits and
     the time budget mark the run `error` and propagate.
@@ -561,7 +597,11 @@ def sync(
         assert row is not None  # noqa: S101 - RETURNING always yields a row
         run_id = cast(int, row[0])
         log.info("sync run %s started", run_id)
-        run = _Run(conn, client_for, settings, clock, clock.monotonic() + max_minutes * 60)
+        start, budget = clock.monotonic(), max_minutes * 60
+        run = _Run(
+            conn, client_for, settings, clock, start + budget,
+            backfill_deadline=start + budget * (1 - BACKFILL_RESERVE),
+        )  # fmt: skip
         status, error = "ok", None
         try:
             try:
@@ -571,6 +611,9 @@ def sync(
                     run.resweep(*resweep)
             except _Stop as stop:
                 status = stop.status
+            finally:
+                if close_clients is not None:
+                    close_clients()  # TDLib is done; the window and embed steps do not need it
             # Window step (§5.3 step 5): local work, so partial runs do it too.
             for key, n in windows.rebuild_dirty(conn, settings).items():
                 run.stats[key] += n
