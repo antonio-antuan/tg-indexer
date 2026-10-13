@@ -5,6 +5,12 @@ on the laptop after each phase (sections 1–4 after P1, 5–11 after P2). Each 
 result next to each box. Never paste message text, phone numbers, codes or keys into this
 file or into an issue.
 
+> **Status (2026-10, SPEC v1.12):** the author has run tgi against real Telegram, so the
+> TDLib, login and sync checks of sections 1–4 have been done live even though the boxes
+> below are not ticked. Section 12 lists the live checks for the v1.12 additions. Since v1.12
+> the default embedding provider is `openai`; section 5 describes the Voyage call, and the
+> same check applies to OpenAI with `OPENAI_API_KEY`.
+
 ## 1. Docker, compose and the `en_US.utf8` database
 
 Every P1 `make ci` so far ran against a user-space Postgres 16 with locale `C.utf8`, not
@@ -87,7 +93,9 @@ no Docker network and no Nano container. With `.env` loaded (`set -a; . ./.env; 
 
 ## 5. One real Voyage call
 
-`EMBED_PROVIDER` now defaults to `voyage`. A `.env` copied from the P1 `.env.example` still
+(Since v1.12 `EMBED_PROVIDER` defaults to `openai`: for Voyage set `EMBED_PROVIDER=voyage`;
+for OpenAI run the same steps with `OPENAI_API_KEY` and read the usage on its dashboard.)
+In P2, `EMBED_PROVIDER` defaulted to `voyage`. A `.env` copied from the P1 `.env.example` still
 says `EMBED_PROVIDER=fake`; set it to `voyage` (or remove the line). `VOYAGE_API_KEY` is the
 real key, or any non-empty placeholder when `api.voyageai.com` goes through the OneCLI
 proxy. Left empty, as in `.env.example`, `tgi embed` stops with `VOYAGE_API_KEY is not set`
@@ -184,6 +192,34 @@ Registration is Antony's step, outside this repo. From inside a Nano agent conta
 ## 11. Links (A11)
 
 - [ ] If section 4 is still open, run it now against the embedded archive.
+
+## 12. The v1.12 additions, live
+
+With a real account and a few enabled chats (a short `--years` is enough):
+
+- [ ] `tgi embed --max-windows 5` with the default `EMBED_PROVIDER=openai` embeds five
+      windows and prints `tokens=`; the OpenAI usage page shows the matching spend.
+- [ ] A first sync of a chat with a long history ends `time_limited` with the backfill
+      unfinished, yet the run stats show a sweep and `embedded` > 0 (`BACKFILL_RESERVE`);
+      `tgi status` shows `history_complete: false` for it and a falling
+      `waiting_for_embedding` over the next runs.
+- [ ] `deploy/tgi-sync.service` and `tgi-sync.timer` installed as user units:
+      `systemctl --user list-timers` shows the next run; a run started while a sync holds the
+      lock ends as success (exit 2); `journalctl --user -u tgi-sync` shows the printed stats.
+- [ ] `tgi chats list` and `tgi chats enable` exit 2 while a sync runs; `tgi chats add <link>`
+      joins a public group and enables it; a join-request link exits 1, nothing enabled.
+- [ ] `tgi recent --hours 24` lists real conversations newest first with working links;
+      `--cursor` from the printed `more:` line continues without repeats; `tgi search
+      … --compact` shows `matched_by` and cut texts.
+- [ ] `tgi status` on the real archive: `sync_lock_held` true during a sync and false after;
+      `last_sync_attempt_at` per chat; `schedule.next_run_at` matches the timer when
+      `SYNC_EVERY_MINUTES` is set.
+- [ ] MCP: `tgi mcp --http` with `MCP_READ_ONLY=1` lists seven tools and never opens TDLib
+      (no TDLib log lines); without it, nine. In the MCP client, the read tools carry
+      `readOnlyHint: true` and `add_chat` does not (a client marking the server untrusted asks
+      before `add_chat` only).
+- [ ] An assistant over MCP answers a "what's new in <tag>" request with `recent` (not an
+      empty `search`) and states the period from the answer's `now`.
 
 ## Outside P2
 

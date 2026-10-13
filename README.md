@@ -327,3 +327,55 @@ other), otherwise `421`; an `Origin`, when sent, must be `http://` plus one of t
 `host.docker.internal`), so a client using an address, the Docker gateway's included, gets
 `421` until the address is in `MCP_ALLOWED_HOSTS`. Other names a client uses go in `MCP_ALLOWED_HOSTS` (comma-separated, no port).
 The rejected header value is not logged.
+
+### Connecting an assistant
+
+Any MCP client works; `docs/AGENT-NOTES.md` is the guidance to give the agent.
+
+- **Same machine, stdio** (no token, no network): the client starts the server and must load
+  `.env` itself, since `tgi` does not. For Claude Code:
+
+  ```sh
+  claude mcp add tgi -- bash -c 'cd ~/tg-indexer && set -a && . ./.env && set +a && exec .venv/bin/tgi mcp --stdio'
+  ```
+
+- **HTTP** (one long-running server, e.g. `deploy/tgi-mcp.service`, shared by several clients):
+  `http://<MCP_BIND>/mcp` with the header `Authorization: Bearer <MCP_TOKEN>`. For Claude Code:
+  `claude mcp add --transport http tgi http://127.0.0.1:8765/mcp --header "Authorization: Bearer $MCP_TOKEN"`.
+- **Hermes Agent** (`~/.hermes/config.yaml` or a profile's, the token in that profile's `.env`
+  as `TGI_MCP_TOKEN`). Seven read tools, plus `add_chat` behind an approval: `trust: untrusted`
+  makes Hermes ask before any tool without `readOnlyHint`, which here is only `add_chat`. Leave
+  `add_chat` out of `include` (or set `MCP_READ_ONLY=1` on the server) to give no write at all.
+
+  ```yaml
+  mcp_servers:
+    tgi:
+      url: "http://127.0.0.1:8765/mcp"
+      headers:
+        Authorization: "Bearer ${TGI_MCP_TOKEN}"
+      trust: untrusted
+      timeout: 120
+      tools:
+        include: [list_chats, list_tags, search, recent, status, get_thread, get_context, add_chat]
+        resources: false
+        prompts: false
+  ```
+
+  Select it with `--toolsets tgi`. Give a chat-facing assistant the tgi tools without a shell
+  where you can: a shell can read `.env` and the TDLib session, which MCP does not expose.
+
+## Operations
+
+- **Backups.** The archive is the Docker volume `pgdata`, not `DATA_DIR`. Back it up with
+  `docker compose exec -T db pg_dump -U tgi -Fc tgi > <private path>/tgi.dump` and test a
+  restore once (`pg_restore -d <empty database>`). The dump holds every archived message: keep
+  it private. `DATA_DIR/accounts` (the TDLib sessions) stays out of backups by design: after a
+  loss, log in again with `tgi accounts add`.
+- **Upgrades.** Stop the timer and the MCP service, pull, `uv sync`, then `tgi db migrate`
+  (it never runs by itself; migration 0004 builds an index that blocks window writes while it
+  runs, so migrate while no sync runs), restart, and check `tgi status`.
+- **Another embedding model or provider** means `tgi embed --reindex`: every embedding is
+  deleted first (even with `--max-windows`) and every window embedded again, paid. Searches in
+  `hybrid` or `semantic` mode answer `model_mismatch` until then; `keyword` keeps working.
+- **Rotating `MCP_TOKEN`:** `tgi mcp token` prints a new value; put it in `.env` and in every
+  client (Hermes: the profile's `TGI_MCP_TOKEN`), then restart `tgi mcp --http`.
