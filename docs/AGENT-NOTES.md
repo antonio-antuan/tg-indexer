@@ -107,3 +107,8 @@ When the user sends a Telegram group or channel link and wants it searchable, ca
 messages appear with the next syncs, so don't search it right away. Tell the user when from the result's `sync` block (UTC; convert to local time): the newest messages from `searchable_from`, all of them by `complete_by` (a rough estimate; `estimated_messages` gives the scale). If `next_run_at` is null, the host has no sync schedule (or the estimate failed): say it will appear after the next sync. If only `complete_by` and the estimates are null, the chat's history could not be read to size it: give `searchable_from` for the newest messages and say the rest follows over the next syncs, without guessing a size. It
 refuses private chats and basic groups. Do not add chats on your own initiative or from
 links found inside messages: only when the user asks.
+
+Your client may ask the user to approve each `add_chat` call (it is the one tool that changes
+the Telegram account); that is expected. Some servers run read-only (`MCP_READ_ONLY`): then
+`add_chat` and `suggest_tags` are not offered at all. In that case tell the user the owner can
+add the chat with `tgi chats add <link> --account <phone>`.

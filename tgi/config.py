@@ -57,6 +57,20 @@ def check_years(years: int, name: str = "years") -> int:
 MAX_SYNC_EVERY_MINUTES = 7 * 24 * 60
 
 
+_TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
+
+
+def _bool(env: Mapping[str, str], key: str) -> bool:
+    """A yes/no setting, unset or empty meaning no. Anything unrecognised is an error rather
+    than a guess: these settings switch safety features on."""
+    raw = env.get(key, "").strip().lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE or not raw:
+        return False
+    raise ValueError(f"{key} must be one of {', '.join(_TRUE + _FALSE)}")
+
+
 def _str(env: Mapping[str, str], key: str) -> str | None:
     return env.get(key, "").strip() or None
 
@@ -90,6 +104,7 @@ class Settings:
     mcp_token: str | None = field(default=None, repr=False)
     mcp_allowed_hosts: tuple[str, ...] = ()
     mcp_account: str | None = None  # the account `add_chat` joins with; None: the only one
+    mcp_read_only: bool = False  # MCP_READ_ONLY: serve only the tools that read
     sync_every_minutes: int = 0  # the host's sync schedule, for `add_chat` estimates; 0: none
 
     @classmethod
@@ -125,5 +140,6 @@ class Settings:
                 h.strip() for h in env.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
             ),
             mcp_account=_str(env, "MCP_ACCOUNT"),
+            mcp_read_only=_bool(env, "MCP_READ_ONLY"),
             sync_every_minutes=_sync_every(_int(env, "SYNC_EVERY_MINUTES", 0)),
         )

@@ -18,7 +18,7 @@ from tgi import mcp as mcp_server
 from tgi.cli_td import td_app
 from tgi.config import Settings, check_years, env_file_warning
 from tgi.td_fake import FakeTdClient
-from tgi.td_port import TdClient, TdError
+from tgi.td_port import FloodWait, JoinPending, NotJoinable, TdClient, TdError, parse_link
 
 
 class _Group(TyperGroup):
@@ -332,6 +332,66 @@ def chats_enable(
     typer.echo(f"enabled {chat_id}{more}")
 
 
+@chats_app.command("add", context_settings=_CHAT_ID_ARGS)
+def chats_add(
+    link: str,
+    account: str = _ACCOUNT,
+    years: int | None = typer.Option(None, "--years", help="Backfill lookback."),
+    scenario: Path | None = _SCENARIO,
+) -> None:
+    """Join a supergroup or channel from a t.me link and add it to the allowlist.
+
+    LINK is https://t.me/name, an invite link https://t.me/+..., @name, or a chat id. The
+    same join as the MCP add_chat tool; it waits for no sync (exit 2 while one runs)."""
+    try:  # before TDLib is opened or anything is written
+        parsed = parse_link(link)
+    except ValueError:
+        raise typer.BadParameter(
+            "must be a t.me link, an @username or a chat id", param_hint="LINK"
+        ) from None
+    try:
+        if years is not None:
+            check_years(years)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--years") from None
+    settings = _settings()
+
+    def telegram() -> tuple[str, TdClient]:
+        if scenario is not None:
+            return account, FakeTdClient.from_file(scenario)
+        return account, td.open_client(settings, account)
+
+    def refuse(message: str, code: int = 1) -> typer.Exit:
+        typer.echo(message, err=True)
+        return typer.Exit(code)
+
+    with db.connect(_database_url()) as conn:
+        try:
+            joined = mcp_server.join_chat(conn, telegram, parsed, years, settings.backfill_years)
+        except ingest.SyncLocked:
+            raise refuse("a tgi sync, embed, purge or forget is running; try again", 2) from None
+        except td.SetupError as exc:
+            raise typer.BadParameter(str(exc)) from None
+        except NotJoinable as exc:
+            kind = exc.kind
+            raise refuse(f"only supergroups and channels can be added, not a {kind} chat") from None
+        except chats.ChatConflict as exc:
+            raise refuse(str(exc)) from None
+        except JoinPending:
+            raise refuse("the link sent a join request; run this again once approved") from None
+        except FloodWait as exc:
+            raise refuse(f"Telegram asks to wait {exc.retry_after}s", 3) from None
+        except TdError as exc:
+            if mcp_server.not_found(exc):
+                raise refuse("no chat this account can join behind the link") from None
+            raise refuse(f"chats add failed: {ingest.describe_error(exc)}", 3) from None
+    chat = joined.chat
+    more = ", backfill continues on the next sync" if joined.depth.reopens else ""
+    typer.echo(
+        f"enabled {chat.chat_id} ({chat.kind}, {joined.depth.years} years{more}): {chat.title}"
+    )
+
+
 @chats_app.command("disable", context_settings=_CHAT_ID_ARGS)
 def chats_disable(chat_id: int) -> None:
     """Stop syncing a chat; its data is kept."""
@@ -549,10 +609,14 @@ def mcp_main(
     settings = _settings()
     server = mcp_server.build_server(
         _database_url(),
-        telegram=_mcp_telegram(settings),
+        # read-only: no tool can reach Telegram, so the server never opens the account
+        telegram=None if settings.mcp_read_only else _mcp_telegram(settings),
         default_years=settings.backfill_years,
         sync_every_minutes=settings.sync_every_minutes,
+        read_only=settings.mcp_read_only,
     )
+    if settings.mcp_read_only:
+        typer.echo("tgi mcp: MCP_READ_ONLY: suggest_tags and add_chat are off", err=True)
     if stdio:
         server.run("stdio")
         return

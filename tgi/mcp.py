@@ -18,6 +18,7 @@ import secrets
 import shutil
 import subprocess
 from collections.abc import Awaitable, Callable, MutableMapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Annotated, Any, Literal, NoReturn, cast
 
@@ -25,7 +26,7 @@ import psycopg
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp_types import CallToolResult, InputRequiredResult, TextContent
+from mcp_types import CallToolResult, InputRequiredResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, Strict, ValidationError
 
 from tgi import chats, db, eta, ingest, search, td
@@ -33,6 +34,8 @@ from tgi.config import Settings, check_years
 from tgi.embed import Embedder
 from tgi.ingest import Conn
 from tgi.td_port import (
+    Chat,
+    ChatLink,
     FloodWait,
     JoinPending,
     Message,
@@ -340,6 +343,49 @@ def _sample(client: TdClient, chat_id: int) -> list[Message] | None:
     return sample
 
 
+@dataclass(frozen=True)
+class Joined:
+    """A chat `join_chat` joined and enabled, the account that joined it, the backfill depth
+    now in force, and the history sample for the estimate (None: unknown)."""
+
+    chat: Chat
+    account: str
+    depth: chats.Depth
+    sample: list[Message] | None
+
+
+def join_chat(
+    conn: Conn, telegram: Telegram, link: ChatLink, years: int | None, default_years: int
+) -> Joined:
+    """Join the chat behind `link` with the account `telegram` opens and add it to the
+    allowlist; the next `tgi sync` fetches it. Only supergroups and channels
+    (`chats.JOINABLE_KINDS`): a private chat or a basic group is refused before anything is
+    joined, and so is a chat enabled under another account (`chats.check_account`, again in
+    `chats.enable`). Runs under the sync lock, since a running `tgi sync` holds the
+    account's TDLib session. Shared by the MCP `add_chat` tool and `tgi chats add`; raises
+    `ingest.SyncLocked`, `td.SetupError`, `NotJoinable`, `chats.ChatConflict`,
+    `JoinPending`, `FloodWait` or `TdError`, and the caller words them."""
+    with ingest.sync_lock(conn):
+        account, client = telegram()
+        try:
+            chat = client.join_chat(
+                link,
+                chats.JOINABLE_KINDS,
+                lambda chat_id: chats.check_account(conn, chat_id, account),
+            )
+            sample = _sample(client, chat.chat_id)
+        finally:
+            with contextlib.suppress(TdError):
+                client.close()
+        depth = chats.enable(conn, chat, account, years, default_years=default_years)
+    return Joined(chat, account, depth, sample)
+
+
+def not_found(exc: TdError) -> bool:
+    """Whether a TDLib error means the link leads nowhere the account can go."""
+    return exc.code == 400 and any(k in str(exc) for k in _NOT_FOUND)
+
+
 def add_chat(
     conn: Conn,
     telegram: Telegram | None,
@@ -349,11 +395,8 @@ def add_chat(
     sync_every_minutes: int = 0,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Join the chat behind `link` and add it to the allowlist; the next `tgi sync` fetches
-    it. Only supergroups and channels (`chats.JOINABLE_KINDS`): a private chat or a basic
-    group is refused before anything is joined, and so is a chat enabled under another
-    account (`chats.check_account`, again in `chats.enable`). Runs under the sync lock,
-    since a running `tgi sync` holds the account's TDLib session."""
+    """The MCP `add_chat` tool: `join_chat`, with its failures as tool error codes and the
+    result's `sync` block estimating when the chat is searchable (`tgi.eta`)."""
     if telegram is None:
         _fail("not_configured", "the server has no Telegram account to join with")
     try:
@@ -366,19 +409,7 @@ def add_chat(
     except ValueError as exc:
         _fail("bad_argument", str(exc))
     try:
-        with ingest.sync_lock(conn):
-            account, client = telegram()
-            try:
-                chat = client.join_chat(
-                    parsed,
-                    chats.JOINABLE_KINDS,
-                    lambda chat_id: chats.check_account(conn, chat_id, account),
-                )
-                sample = _sample(client, chat.chat_id)
-            finally:
-                with contextlib.suppress(TdError):
-                    client.close()
-            depth = chats.enable(conn, chat, account, years, default_years=default_years)
+        joined = join_chat(conn, telegram, parsed, years, default_years)
     except ingest.SyncLocked:
         _fail("busy", "a tgi sync is running; try again when it ends")
     except td.SetupError as exc:
@@ -392,18 +423,20 @@ def add_chat(
     except FloodWait as exc:
         _fail("flood_wait", f"Telegram asks to wait {exc.retry_after}s")
     except TdError as exc:
-        if exc.code == 400 and any(k in str(exc) for k in _NOT_FOUND):
+        if not_found(exc):
             _fail("not_found", "no chat this account can join behind the link")
         _fail("telegram_error", f"TDLib error {exc.code}")
+    chat = joined.chat
     log.info("add_chat: enabled chat %s (%s)", chat.chat_id, chat.kind)
     try:
-        when = eta.estimate(conn, chat.chat_id, sample, now or datetime.now(UTC), depth.years,
-                            sync_every_minutes, ingest.DEFAULT_MAX_MINUTES)  # fmt: skip
+        when = eta.estimate(conn, chat.chat_id, joined.sample, now or datetime.now(UTC),
+                            joined.depth.years, sync_every_minutes,
+                            ingest.DEFAULT_MAX_MINUTES)  # fmt: skip
     except Exception as exc:  # the chat is enabled: an estimate failure must not hide that
         log.warning("add_chat: no estimate for chat %s (%s)", chat.chat_id, type(exc).__name__)
         when = eta.UNKNOWN
     return {"chat_id": chat.chat_id, "title": chat.title, "kind": chat.kind,
-            "username": chat.username, "backfill_years": depth.years,
+            "username": chat.username, "backfill_years": joined.depth.years,
             "sync": when.as_dict()}  # fmt: skip
 
 
@@ -413,6 +446,17 @@ def _iso(value: object) -> str | None:
 
 
 # --- the server -------------------------------------------------------------------------------
+
+# MCP tool annotations, so a client can tell reads from writes: Hermes on an `untrusted`
+# server asks the user before any tool without `readOnlyHint`, and only retries those with
+# it after an expired session. Hints, not enforcement: `MCP_READ_ONLY` is the server's own.
+READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+SUGGEST = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+)
+JOIN = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True
+)
 
 
 class _Server(MCPServer):
@@ -447,13 +491,18 @@ def build_server(
     telegram: Telegram | None = None,
     default_years: int = Settings.backfill_years,
     sync_every_minutes: int = 0,
+    read_only: bool = False,
 ) -> MCPServer:
-    """The seven tools; `embedder` replaces the configured provider (tests); `telegram`
-    opens the account `add_chat` joins with (none: the tool answers `not_configured`);
-    `default_years` is `BACKFILL_YEARS`; `sync_every_minutes` is `SYNC_EVERY_MINUTES`."""
+    """The seven tools, or with `read_only` (`MCP_READ_ONLY`) the five that only read:
+    `suggest_tags` and `add_chat` are then not registered at all, whatever a client asks.
+    `embedder` replaces the configured provider (tests); `telegram` opens the account
+    `add_chat` joins with (none: the tool answers `not_configured`); `default_years` is
+    `BACKFILL_YEARS`; `sync_every_minutes` is `SYNC_EVERY_MINUTES`."""
     server = _Server(
         "tgi",
-        instructions="Search a personal Telegram archive; add_chat joins a group or channel"
+        instructions="Search a personal Telegram archive (read-only)."
+        if read_only
+        else "Search a personal Telegram archive; add_chat joins a group or channel"
         " and adds it to the archive.",
     )
 
@@ -465,18 +514,18 @@ def build_server(
                 # a NUL byte, a tag too long for the index, ...
                 _fail("bad_argument", f"an argument cannot be stored ({type(exc).__name__})")
 
-    @server.tool(name="list_chats")
+    @server.tool(name="list_chats", annotations=READ_ONLY)
     def list_chats_tool(tag: str | None = None) -> list[dict[str, Any]]:
         """Chats in the archive with confirmed tags, message counts and date range.
         `tag` keeps the chats that tag is confirmed for."""
         return connected(lambda conn: list_chats(conn, tag))
 
-    @server.tool(name="list_tags")
+    @server.tool(name="list_tags", annotations=READ_ONLY)
     def list_tags_tool() -> list[dict[str, Any]]:
         """Tags with their status (`confirmed` filters search, `proposed` does not)."""
         return connected(list_tags)
 
-    @server.tool(name="search")
+    @server.tool(name="search", annotations=READ_ONLY)
     def search_tool(
         queries: list[str],
         tags: list[str] | None = None,
@@ -496,12 +545,12 @@ def build_server(
             )
         )
 
-    @server.tool(name="get_thread")
+    @server.tool(name="get_thread", annotations=READ_ONLY)
     def get_thread_tool(chat_id: Int, message_id: Int, limit: Int = 50) -> list[dict[str, Any]]:
         """The reply chain up to the root message and the replies to it (at most 50)."""
         return connected(lambda conn: get_thread(conn, chat_id, message_id, limit))
 
-    @server.tool(name="get_context")
+    @server.tool(name="get_context", annotations=READ_ONLY)
     def get_context_tool(
         chat_id: Int, message_id: Int, before: Int = 10, after: Int = 10
     ) -> list[dict[str, Any]]:
@@ -509,12 +558,15 @@ def build_server(
         most 100 messages are returned, the message included)."""
         return connected(lambda conn: get_context(conn, chat_id, message_id, before, after))
 
-    @server.tool(name="suggest_tags")
+    if read_only:
+        return server
+
+    @server.tool(name="suggest_tags", annotations=SUGGEST)
     def suggest_tags_tool(suggestions: list[Suggestion]) -> dict[str, int]:
         """Propose tags for chats; the owner confirms them before they filter search."""
         return connected(lambda conn: suggest_tags(conn, suggestions))
 
-    @server.tool(name="add_chat")
+    @server.tool(name="add_chat", annotations=JOIN)
     def add_chat_tool(link: str, years: Int | None = None) -> dict[str, Any]:
         """Join a Telegram group or channel and add it to the archive; its history arrives
         with the next sync. `link`: https://t.me/name, an invite link https://t.me/+…,

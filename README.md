@@ -51,13 +51,18 @@ command stops (exit 1) before it creates a client.
 `tgi` does not read `.env` itself, but every command warns on stderr when the `.env` in the
 current directory is more open than 0600 (the line names the file and its mode only).
 A TDLib error in `tgi chats list` or `tgi chats enable` exits 3 with the error type and
-code, as `sync` does.
+code, as `sync` does. `tgi chats add` takes the same links as the MCP `add_chat` tool and
+refuses the same chats: a private chat, a basic group, a chat enabled under another account,
+a link that sends a join request (run it again once approved) or leads nowhere all exit 1
+with nothing enabled; it exits 2 while a sync (or `embed`, `purge`, `forget`) holds the lock,
+and 3 on another TDLib error or a flood wait.
 
 ## Sync
 
 ```sh
 uv run tgi chats list --account +34...             # the account's dialogs; * = enabled by it
 uv run tgi chats enable <chat_id> --account +34... [--years N]  # --years (1–100) is kept until changed; a larger value continues the backfill on the next sync; a smaller one deletes nothing
+uv run tgi chats add <link> --account +34... [--years N]  # join a supergroup or channel from a t.me link (or @name) and enable it, like the MCP add_chat
 uv run tgi sync [--max-minutes 150]                # catch-up, interleaved backfill, sweep
 uv run tgi sync --resweep-days N <chat_id>         # only that chat's sweep, N days deep
 uv run tgi chats disable <chat_id>                 # stop syncing, keep data
@@ -168,7 +173,19 @@ adds `proposed` tags (`proposed_by` `mcp`), and `add_chat`, which joins a superg
 channel from a `t.me` link with `MCP_ACCOUNT` (default: the only logged-in account) and
 enables it; private chats and basic groups are refused, and during a `tgi sync` it answers
 `busy`. The server then needs the TDLib settings of `.env` (`DATA_DIR`, `TDLIB_DB_KEY`,
-`TG_API_ID`, `TG_API_HASH`) as well. A tool error's text is the SDK's prefix
+`TG_API_ID`, `TG_API_HASH`) as well.
+
+With `MCP_READ_ONLY=1` (also `true`, `yes`, `on`; unset, empty, `0`, `false`, `no`, `off` mean
+off, anything else is a usage error) the server offers only the five read tools:
+`suggest_tags` and `add_chat` are not registered at all, a call to them gets `unknown_tool`,
+and the server never opens the Telegram account, so it needs no TDLib settings. Add chats with
+`tgi chats add` then. Every tool carries MCP annotations so a client can tell reads from
+writes: the read tools `readOnlyHint: true`, `suggest_tags` and `add_chat` `readOnlyHint:
+false` (`add_chat` also `openWorldHint: true`). A client can then run reads unattended and ask
+the user before a write; in Hermes that is `trust: untrusted` on the server. The annotations
+are hints for well-behaved clients; `MCP_READ_ONLY` is what the server enforces.
+
+A tool error's text is the SDK's prefix
 `Error executing tool <name>: ` followed by a JSON object `{"code": ..., "message": ...}`;
 `code` is `unknown_chat`, `unknown_tag`, `bad_range`, `bad_argument` (also a schema or type
 error, such as `limit: true`, or a value Postgres cannot store), `embedder_unavailable` or
