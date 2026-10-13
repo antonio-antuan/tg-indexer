@@ -173,7 +173,9 @@ def test_a8_tools_answer_with_the_spec_shapes_over_http_and_stdio(
 
     (hit,) = keyword
     assert set(hit) == {"window_id", "chat_id", "chat_title", "tags", "start_date",
-                        "end_date", "score", "messages", "highlights"}  # fmt: skip
+                        "end_date", "score", "messages", "highlights", "matched_by",
+                        "matched_message_ids", "matched_queries", "semantic_distance",
+                        "omitted_messages"}  # fmt: skip
     assert (hit["chat_id"], hit["tags"], server_ids(hit["messages"])) == (A, ["spain"], [1])
     assert hit["messages"][0] == {
         "message_id": mid(1),

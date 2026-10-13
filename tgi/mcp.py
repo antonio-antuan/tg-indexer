@@ -72,6 +72,7 @@ def _fail(code: str, message: str) -> NoReturn:
 
 # A JSON integer: pydantic would otherwise take `true` as 1 and "5" as 5.
 Int = Annotated[int, Strict()]
+Bool = Annotated[bool, Strict()]  # a JSON boolean, not "yes" or 1
 
 
 def _when(value: object) -> object:
@@ -165,6 +166,7 @@ def run_search(
     mode: search.Mode = "hybrid",
     limit: int = 20,
     embedder: Embedder | None = None,
+    compact: bool = False,
 ) -> list[dict[str, Any]]:
     if not 1 <= limit <= search.MAX_LIMIT:
         _fail("bad_range", f"limit must be between 1 and {search.MAX_LIMIT}")
@@ -183,6 +185,7 @@ def run_search(
             mode=mode,
             limit=limit,
             embedder=embedder,
+            compact=compact,
         )
     except search.BadRange as exc:
         _fail("bad_range", str(exc))
@@ -205,6 +208,7 @@ def run_recent(
     limit: int = 20,
     cursor: str | None = None,
     now: datetime | None = None,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """The `recent` tool: `hours` back from the server's clock (default 24), or an explicit
     `since` (and optional `until`); never both, and `until` only with `since`. With a
@@ -237,6 +241,7 @@ def run_recent(
             limit=limit,
             cursor=cursor,
             now=now,
+            compact=compact,
         )
     except search.BadRange as exc:
         _fail("bad_range", str(exc))
@@ -599,16 +604,24 @@ def build_server(
         until: When | None = None,
         mode: Literal["hybrid", "keyword", "semantic"] = "hybrid",
         limit: Int = 20,
+        compact: Bool = False,
     ) -> list[dict[str, Any]]:
         """Conversation windows matching any of `queries` (pass translations and variants;
         `"a phrase"`, `-word`), fused by rank, best first. `tags` are confirmed tags;
         `since`/`until` are inclusive: a date (YYYY-MM-DD) is a whole UTC day, a date-time
         an exact instant (UTC without a zone); `limit` is at most 50. Needs a topic: for
-        "what's new" use `recent`. Retry with mode="keyword" on `embedder_unavailable` or
-        `model_mismatch`."""
+        "what's new" use `recent`. Each hit says how it was retrieved (not that it is
+        relevant: check the text): `matched_by` (keyword, trigram, semantic),
+        `matched_message_ids` (the keyword legs' matches), `matched_queries` (0-based
+        positions in `queries`) and `semantic_distance` (the smallest cosine distance over
+        the queries, lower is closer; null when the semantic leg did not find it).
+        `compact=true` keeps the matched messages and 2 neighbours each (a semantic-only hit:
+        its first 5, a sample), cuts long texts (`truncated`) and counts the rest in
+        `omitted_messages` (`get_context` reads them).
+        Retry with mode="keyword" on `embedder_unavailable` or `model_mismatch`."""
         return connected(
             lambda conn: run_search(
-                conn, queries, tags, chat_ids, since, until, mode, limit, embedder
+                conn, queries, tags, chat_ids, since, until, mode, limit, embedder, compact
             )
         )
 
@@ -621,6 +634,7 @@ def build_server(
         until: When | None = None,
         limit: Int = 20,
         cursor: str | None = None,
+        compact: Bool = False,
     ) -> dict[str, Any]:
         """What's new, without a topic: conversation windows with messages posted in a time
         range, newest activity first, each with only its messages inside the range. Range:
@@ -628,12 +642,15 @@ def build_server(
         optionally `until` (omit `hours` then): `since` ≤ date < `until`, a date meaning
         that UTC day, `until` defaulting to now. The answer has the server's `now`, the
         exact range covered (UTC), `hits` (score has no meaning here) and `next_cursor`.
-        For the next page call recent(cursor=<next_cursor>): the cursor keeps the range and
-        filters, so other arguments but `limit` are ignored. Continue until `next_cursor`
-        is null, even after a short or empty page. Use for digests and "what happened in
-        these chats"; use `search` for a topic."""
+        For the next page call recent(cursor=<next_cursor>): the cursor keeps the range,
+        filters and `compact`, so other arguments but `limit` are ignored. Continue until
+        `next_cursor` is null, even after a short or empty page. `compact=true` cuts long texts
+        (`truncated`). Use for digests and "what happened in these chats"; use `search` for
+        a topic."""
         return connected(
-            lambda conn: run_recent(conn, tags, chat_ids, hours, since, until, limit, cursor)
+            lambda conn: run_recent(
+                conn, tags, chat_ids, hours, since, until, limit, cursor, compact=compact
+            )
         )
 
     @server.tool(name="status", annotations=READ_ONLY)

@@ -156,6 +156,7 @@ uv run tgi search "продление ВНЖ" "renovación TIE" [--json]   # sev
 uv run tgi search QUERY --mode hybrid|keyword|semantic        # default hybrid
 uv run tgi search QUERY --tag TAG --chat CHAT_ID --since 2026-01-01 --until 2026-03-31
 uv run tgi search QUERY --include-deleted --limit 50          # tombstoned messages too
+uv run tgi search QUERY --compact                             # matched messages and 2 neighbours, long texts cut
 uv run tgi recent [--hours 24 | --since … [--until …]] [--tag TAG] [--chat ID] [--json]  # what's new, no query
 uv run tgi status [--chat ID] [--json]                        # how current the archive is
 uv run tgi tags propose|confirm|remove <chat_id> <tag>      # only confirmed tags filter
@@ -172,6 +173,15 @@ conversation windows, ranked by reciprocal-rank fusion across the queries, each 
 a `t.me` link where Telegram has one (supergroups and channels; not basic groups or private
 chats). `--since`/`--until` take a date, a whole UTC day, or an ISO date-time, an exact
 inclusive instant (UTC when it has no zone); `--tag` and `--chat` may be repeated.
+
+Every hit says how it was retrieved (not whether it is relevant): `matched_by` (`keyword`,
+`trigram`, `semantic`), `matched_message_ids` (the messages the keyword legs matched),
+`matched_queries` (0-based positions in the queries given, empty ones counted) and
+`semantic_distance` (the smallest cosine distance over the queries, lower is closer; null when
+the semantic leg did not find it). `--compact` (MCP
+`compact`) keeps each hit's matched messages and two neighbours each (the first five when only
+the semantic leg found it), cuts texts over 400 characters (marked `truncated`) and counts the
+rest in `omitted_messages`; for `tgi recent` it only cuts texts.
 
 `tgi status` shows how current the archive is: whether a sync runs now, the next scheduled run
 (an estimate from `SYNC_EVERY_MINUTES`), the last run (status, counts) and the last `ok` one (a

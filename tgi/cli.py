@@ -502,6 +502,7 @@ def search_command(
     limit: int = typer.Option(20, "--limit", min=1, max=search.MAX_LIMIT),
     include_deleted: bool = typer.Option(False, "--include-deleted"),
     as_json: bool = typer.Option(False, "--json", help="Print the hits as JSON."),
+    compact: bool = typer.Option(False, "--compact", help="Matched messages and neighbours."),
     mode: str = typer.Option(
         "hybrid", "--mode", help="hybrid, keyword or semantic.", show_default=True
     ),
@@ -521,6 +522,7 @@ def search_command(
                 mode=cast(search.Mode, mode),
                 limit=limit,
                 include_deleted=include_deleted,
+                compact=compact,
             )
     except (search.EmbedderUnavailable, search.ModelMismatch) as exc:
         typer.echo(f"search failed: {exc}", err=True)
@@ -532,7 +534,10 @@ def search_command(
         return
     for h in hits:
         where = "message" if h.window_id is None else f"window {h.window_id}"
-        typer.echo(f"{h.score:.4f}  {h.chat_title}  {h.start_date:%Y-%m-%d %H:%M}  ({where})")
+        why = ",".join(h.matched_by)
+        typer.echo(
+            f"{h.score:.4f}  {h.chat_title}  {h.start_date:%Y-%m-%d %H:%M}  ({where}; {why})"
+        )
         for m in h.messages:
             typer.echo(f"  {m.date:%Y-%m-%d %H:%M} {m.sender_name or '?'}: {m.text}")
             typer.echo(f"    {m.link or '(no link)'}")
@@ -562,6 +567,7 @@ def recent_command(
     limit: int = typer.Option(20, "--limit", min=1, max=search.MAX_LIMIT),
     cursor: str | None = typer.Option(None, "--cursor", help="next_cursor of a previous page."),
     as_json: bool = typer.Option(False, "--json", help="Print the answer as JSON."),
+    compact: bool = typer.Option(False, "--compact", help="Cut long message texts."),
 ) -> None:
     """What's new: windows with messages in a time range, newest first, no query.
 
@@ -586,6 +592,7 @@ def recent_command(
                 limit=limit,
                 cursor=cursor,
                 now=now,
+                compact=compact,
             )
     except ValueError as exc:  # bad range, a cursor this tool did not print
         raise typer.BadParameter(str(exc)) from None

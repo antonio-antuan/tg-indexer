@@ -114,6 +114,20 @@ current, or a search finds little, call `status` (optionally with `chat_ids`):
 - Hits are conversation windows, best first. Hybrid search has no relevance cut-off: the
   last hits can be unrelated windows that merely pass the filters. Read the top hits and
   judge relevance from the text; do not treat every hit as an answer.
+- Each hit says how it was retrieved: `matched_by` (`keyword`, `trigram`, `semantic`),
+  `matched_message_ids` (the messages the keyword legs matched; use them with
+  `get_context`), `matched_queries` (0-based positions in your `queries`) and
+  `semantic_distance` (the smallest over your queries; lower is closer). That is evidence
+  of retrieval, not of relevance: the semantic leg always returns its nearest windows, so
+  an unrelated window can match every query, and a negation-only query matches as
+  `keyword` without any positive term. There is no distance threshold that means
+  "relevant". Use provenance to choose what to read first, and judge from the text.
+- Start with `compact=true` (and `limit` 10–20) to keep answers small: each hit keeps its
+  matched messages and two neighbours, long texts are cut (`truncated`), and
+  `omitted_messages` says how many were left out. A hit only the semantic leg found shows
+  its first five messages, a sample rather than the relevant part: read it with
+  `get_context` before accepting or rejecting it, and read any truncated message you rely
+  on. For `recent`, `compact=true` only cuts long texts, and the cursor keeps it.
 - Each message has `message_id`, `date`, `sender_name`, `text` and `link`, but no
   `chat_id`. In `search`, `chat_id` and `chat_title` are on the hit that holds the
   messages. In `get_thread` and `get_context`, the chat is the `chat_id` you passed.
