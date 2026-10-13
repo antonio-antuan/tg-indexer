@@ -5,7 +5,7 @@ import os
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -469,15 +469,6 @@ def tags_remove(chat_id: int, tag: str) -> None:
     typer.echo(f"removed {tag.strip()} from {chat_id}")
 
 
-def _date(value: str | None, name: str) -> date | None:
-    if value is None:
-        return None
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        raise typer.BadParameter(f"{name} must be a date, YYYY-MM-DD") from None
-
-
 _QUERIES = typer.Argument(..., help="One or more queries; hits are fused.")
 _TAGS = typer.Option(None, "--tag", help="Confirmed tag (repeatable).")
 _CHATS = typer.Option(None, "--chat", help="Chat id (repeatable).")
@@ -488,8 +479,12 @@ def search_command(
     queries: list[str] = _QUERIES,
     tag: list[str] | None = _TAGS,
     chat: list[int] | None = _CHATS,
-    since: str | None = typer.Option(None, "--since", help="First day, YYYY-MM-DD (UTC)."),
-    until: str | None = typer.Option(None, "--until", help="Last day, YYYY-MM-DD (UTC)."),
+    since: str | None = typer.Option(
+        None, "--since", help="First day YYYY-MM-DD, or an ISO date-time (UTC)."
+    ),
+    until: str | None = typer.Option(
+        None, "--until", help="Last day YYYY-MM-DD, or an ISO date-time (UTC)."
+    ),
     limit: int = typer.Option(20, "--limit", min=1, max=search.MAX_LIMIT),
     include_deleted: bool = typer.Option(False, "--include-deleted"),
     as_json: bool = typer.Option(False, "--json", help="Print the hits as JSON."),
@@ -507,8 +502,8 @@ def search_command(
                 queries,
                 tags=tag or None,
                 chat_ids=chat or None,
-                since=_date(since, "--since"),
-                until=_date(until, "--until"),
+                since=_when(since, "--since"),
+                until=_when(until, "--until"),
                 mode=cast(search.Mode, mode),
                 limit=limit,
                 include_deleted=include_deleted,
@@ -527,6 +522,69 @@ def search_command(
         for m in h.messages:
             typer.echo(f"  {m.date:%Y-%m-%d %H:%M} {m.sender_name or '?'}: {m.text}")
             typer.echo(f"    {m.link or '(no link)'}")
+
+
+def _when(value: str | None, name: str) -> date | None:
+    """A date (a whole UTC day) or an ISO date-time (UTC without a zone)."""
+    if value is None:
+        return None
+    try:
+        return search.parse_when(value)
+    except ValueError:
+        raise typer.BadParameter(f"{name} must be YYYY-MM-DD or an ISO date-time") from None
+
+
+@app.command("recent")
+def recent_command(
+    tag: list[str] | None = _TAGS,
+    chat: list[int] | None = _CHATS,
+    hours: int | None = typer.Option(
+        None, "--hours", min=1, max=search.MAX_RECENT_HOURS, help="Back from now (default 24)."
+    ),
+    since: str | None = typer.Option(None, "--since", help="YYYY-MM-DD or ISO date-time (UTC)."),
+    until: str | None = typer.Option(
+        None, "--until", help="Exclusive end: YYYY-MM-DD (that whole day) or ISO date-time."
+    ),
+    limit: int = typer.Option(20, "--limit", min=1, max=search.MAX_LIMIT),
+    cursor: str | None = typer.Option(None, "--cursor", help="next_cursor of a previous page."),
+    as_json: bool = typer.Option(False, "--json", help="Print the answer as JSON."),
+) -> None:
+    """What's new: windows with messages in a time range, newest first, no query.
+
+    --until is exclusive and defaults to now. --cursor continues a listing: it keeps the
+    range and filters, so the other options but --limit are ignored with it."""
+    if cursor is None and hours is not None and since is not None:
+        raise typer.BadParameter("give --hours or --since, not both")
+    if cursor is None and until is not None and since is None:
+        raise typer.BadParameter("--until needs --since")
+    now = datetime.now(UTC)
+    if cursor is not None:  # the cursor carries the range: --since/--until are not read
+        since = until = None
+    start = None if cursor else _when(since, "--since") or now - timedelta(hours=hours or 24)
+    try:
+        with db.connect(_database_url()) as conn:
+            answer = search.recent(
+                conn,
+                since=start,
+                until=_when(until, "--until"),
+                tags=tag or None,
+                chat_ids=chat or None,
+                limit=limit,
+                cursor=cursor,
+                now=now,
+            )
+    except ValueError as exc:  # bad range, a cursor this tool did not print
+        raise typer.BadParameter(str(exc)) from None
+    if as_json:
+        typer.echo(json.dumps(answer.as_dict(), ensure_ascii=False, indent=2))
+        return
+    for h in answer.hits:
+        typer.echo(f"{h.chat_title}  {h.start_date:%Y-%m-%d %H:%M}  (window {h.window_id})")
+        for m in h.messages:
+            typer.echo(f"  {m.date:%Y-%m-%d %H:%M} {m.sender_name or '?'}: {m.text}")
+            typer.echo(f"    {m.link or '(no link)'}")
+    if answer.next_cursor is not None:
+        typer.echo(f"more: tgi recent --cursor {answer.next_cursor}")
 
 
 _REFERENCE = typer.Option(

@@ -131,6 +131,7 @@ uv run tgi search "продление ВНЖ" "renovación TIE" [--json]   # sev
 uv run tgi search QUERY --mode hybrid|keyword|semantic        # default hybrid
 uv run tgi search QUERY --tag TAG --chat CHAT_ID --since 2026-01-01 --until 2026-03-31
 uv run tgi search QUERY --include-deleted --limit 50          # tombstoned messages too
+uv run tgi recent [--hours 24 | --since … [--until …]] [--tag TAG] [--chat ID] [--json]  # what's new, no query
 uv run tgi tags propose|confirm|remove <chat_id> <tag>      # only confirmed tags filter
 ```
 
@@ -143,7 +144,21 @@ through the russian and english configs); a word that all three drop (`-a`) excl
 nothing. Matching messages are returned as their
 conversation windows, ranked by reciprocal-rank fusion across the queries, each message with
 a `t.me` link where Telegram has one (supergroups and channels; not basic groups or private
-chats). `--since`/`--until` are whole UTC days; `--tag` and `--chat` may be repeated.
+chats). `--since`/`--until` take a date, a whole UTC day, or an ISO date-time, an exact
+inclusive instant (UTC when it has no zone); `--tag` and `--chat` may be repeated.
+
+`tgi recent` answers "what's new" without a topic: the conversation windows with messages
+posted in a time range, newest activity first (by each window's last message), each showing
+only its messages inside the range. The range is `--hours` back from now (default 24, at most
+744), or `--since` and optionally `--until`: `since` ≤ date < `until`. Unlike `search`, `--until`
+is exclusive (a date means up to the end of that UTC day) and defaults to now, so consecutive
+ranges meet without gap or overlap. Pages hold `--limit` windows (at most 50); when more follow
+it prints `more: tgi recent --cursor …` (with `--json`, `next_cursor`). The cursor keeps the
+range and filters, so `--cursor` alone continues (other options but `--limit` are ignored with
+it), and a short or even empty page can still have more. Paging runs over live data: a sync
+between pages can move a window, which then repeats or drops out. Messages a sync has stored but
+not yet put in a window (the window step runs at the end of every sync) and tombstoned messages
+are not listed.
 
 `--mode semantic` embeds each query with the `EMBED_PROVIDER` and takes the 100 nearest
 embedded windows (cosine) under the same tag, chat and date filters (a window counts when
@@ -167,8 +182,8 @@ uv run tgi mcp --http       # streamable HTTP at http://MCP_BIND/mcp, Bearer MCP
 uv run tgi mcp --stdio      # the same tools over stdin/stdout, for local debugging
 ```
 
-Seven tools (SPEC §5.6): `list_chats`, `list_tags`, `search` (as `tgi search --json`, `limit`
-≤ 50), `get_thread`, `get_context` (`before + after` ≤ 100, at most 100 messages with the message itself), `suggest_tags`, which only
+Eight tools (SPEC §5.6): `list_chats`, `list_tags`, `search` (as `tgi search --json`, `limit`
+≤ 50), `recent` (as `tgi recent --json`; `hours` or `since`/`until`, a `cursor` to page), `get_thread`, `get_context` (`before + after` ≤ 100, at most 100 messages with the message itself), `suggest_tags`, which only
 adds `proposed` tags (`proposed_by` `mcp`), and `add_chat`, which joins a supergroup or
 channel from a `t.me` link with `MCP_ACCOUNT` (default: the only logged-in account) and
 enables it; private chats and basic groups are refused, and during a `tgi sync` it answers
@@ -176,7 +191,7 @@ enables it; private chats and basic groups are refused, and during a `tgi sync` 
 `TG_API_ID`, `TG_API_HASH`) as well.
 
 With `MCP_READ_ONLY=1` (also `true`, `yes`, `on`; unset, empty, `0`, `false`, `no`, `off` mean
-off, anything else is a usage error) the server offers only the five read tools:
+off, anything else is a usage error) the server offers only the six read tools:
 `suggest_tags` and `add_chat` are not registered at all, a call to them gets `unknown_tool`,
 and the server never opens the Telegram account, so it needs no TDLib settings. Add chats with
 `tgi chats add` then. Every tool carries MCP annotations so a client can tell reads from

@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from collections.abc import Awaitable, Callable, MutableMapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, NoReturn, cast
 
 import psycopg
@@ -27,7 +27,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import CallToolResult, InputRequiredResult, TextContent, ToolAnnotations
-from pydantic import BaseModel, Strict, ValidationError
+from pydantic import BaseModel, BeforeValidator, Strict, ValidationError
 
 from tgi import chats, db, eta, ingest, search, td
 from tgi.config import Settings, check_years
@@ -72,6 +72,21 @@ def _fail(code: str, message: str) -> NoReturn:
 
 # A JSON integer: pydantic would otherwise take `true` as 1 and "5" as 5.
 Int = Annotated[int, Strict()]
+
+
+def _when(value: object) -> object:
+    """`YYYY-MM-DD` stays a date (a whole UTC day); anything with a time is a date-time
+    (`search.parse_when`). Parsed here because pydantic's `date | datetime` turns a midnight
+    date-time into a date, and would take a number as a Unix time."""
+    if isinstance(value, str):
+        return search.parse_when(value)
+    if isinstance(value, date):  # Python callers
+        return value
+    raise ValueError("a date must be a YYYY-MM-DD or ISO date-time string")
+
+
+# A date or a date-time bound, as `search` and `recent` take them.
+When = Annotated[date | datetime, BeforeValidator(_when)]
 
 
 class Suggestion(BaseModel):
@@ -145,7 +160,7 @@ def run_search(
     queries: list[str],
     tags: list[str] | None = None,
     chat_ids: list[int] | None = None,
-    since: date | None = None,
+    since: date | None = None,  # a datetime too: a `date` is a whole UTC day
     until: date | None = None,
     mode: search.Mode = "hybrid",
     limit: int = 20,
@@ -178,6 +193,56 @@ def run_search(
     except ValueError as exc:  # no non-empty query
         _fail("bad_argument", str(exc))
     return [h.as_dict() for h in hits]
+
+
+def run_recent(
+    conn: Conn,
+    tags: list[str] | None = None,
+    chat_ids: list[int] | None = None,
+    hours: int | None = None,
+    since: date | None = None,
+    until: date | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """The `recent` tool: `hours` back from the server's clock (default 24), or an explicit
+    `since` (and optional `until`); never both, and `until` only with `since`. With a
+    `cursor`, its range and filters are used and the other arguments but `limit` ignored."""
+    if not 1 <= limit <= search.MAX_LIMIT:
+        _fail("bad_range", f"limit must be between 1 and {search.MAX_LIMIT}")
+    now = now or datetime.now(UTC)
+    if cursor is not None:
+        hours = since = until = tags = chat_ids = None
+    if hours is not None and since is not None:
+        _fail("bad_argument", "give hours or since, not both")
+    if until is not None and since is None:
+        _fail("bad_argument", "until needs since")
+    if since is None and cursor is None:
+        hours = 24 if hours is None else hours
+        if not 1 <= hours <= search.MAX_RECENT_HOURS:
+            _fail("bad_range", f"hours must be between 1 and {search.MAX_RECENT_HOURS}")
+        since = now - timedelta(hours=hours)
+    if tags:
+        _check_tags(conn, tags)
+    if chat_ids:
+        _check_chats(conn, chat_ids)
+    try:
+        answer = search.recent(
+            conn,
+            since=since,
+            until=until,
+            tags=tags or None,
+            chat_ids=chat_ids or None,
+            limit=limit,
+            cursor=cursor,
+            now=now,
+        )
+    except search.BadRange as exc:
+        _fail("bad_range", str(exc))
+    except ValueError as exc:  # a cursor this server did not return
+        _fail("bad_argument", str(exc))
+    return answer.as_dict()
 
 
 def _chat(conn: Conn, chat_id: int) -> tuple[str, str | None]:
@@ -493,7 +558,7 @@ def build_server(
     sync_every_minutes: int = 0,
     read_only: bool = False,
 ) -> MCPServer:
-    """The seven tools, or with `read_only` (`MCP_READ_ONLY`) the five that only read:
+    """The eight tools, or with `read_only` (`MCP_READ_ONLY`) the six that only read:
     `suggest_tags` and `add_chat` are then not registered at all, whatever a client asks.
     `embedder` replaces the configured provider (tests); `telegram` opens the account
     `add_chat` joins with (none: the tool answers `not_configured`); `default_years` is
@@ -530,19 +595,45 @@ def build_server(
         queries: list[str],
         tags: list[str] | None = None,
         chat_ids: list[Int] | None = None,
-        since: date | None = None,
-        until: date | None = None,
+        since: When | None = None,
+        until: When | None = None,
         mode: Literal["hybrid", "keyword", "semantic"] = "hybrid",
         limit: Int = 20,
     ) -> list[dict[str, Any]]:
         """Conversation windows matching any of `queries` (pass translations and variants;
-        `"a phrase"`, `-word`), fused by rank. `tags` are confirmed tags; `since`/`until`
-        are whole UTC days; `limit` is at most 50. Retry with mode="keyword" on
-        `embedder_unavailable` or `model_mismatch`."""
+        `"a phrase"`, `-word`), fused by rank, best first. `tags` are confirmed tags;
+        `since`/`until` are inclusive: a date (YYYY-MM-DD) is a whole UTC day, a date-time
+        an exact instant (UTC without a zone); `limit` is at most 50. Needs a topic: for
+        "what's new" use `recent`. Retry with mode="keyword" on `embedder_unavailable` or
+        `model_mismatch`."""
         return connected(
             lambda conn: run_search(
                 conn, queries, tags, chat_ids, since, until, mode, limit, embedder
             )
+        )
+
+    @server.tool(name="recent", annotations=READ_ONLY)
+    def recent_tool(
+        tags: list[str] | None = None,
+        chat_ids: list[Int] | None = None,
+        hours: Int | None = None,
+        since: When | None = None,
+        until: When | None = None,
+        limit: Int = 20,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """What's new, without a topic: conversation windows with messages posted in a time
+        range, newest activity first, each with only its messages inside the range. Range:
+        `hours` back from the server's clock (default 24, at most 744), or `since` and
+        optionally `until` (omit `hours` then): `since` ≤ date < `until`, a date meaning
+        that UTC day, `until` defaulting to now. The answer has the server's `now`, the
+        exact range covered (UTC), `hits` (score has no meaning here) and `next_cursor`.
+        For the next page call recent(cursor=<next_cursor>): the cursor keeps the range and
+        filters, so other arguments but `limit` are ignored. Continue until `next_cursor`
+        is null, even after a short or empty page. Use for digests and "what happened in
+        these chats"; use `search` for a topic."""
+        return connected(
+            lambda conn: run_recent(conn, tags, chat_ids, hours, since, until, limit, cursor)
         )
 
     @server.tool(name="get_thread", annotations=READ_ONLY)

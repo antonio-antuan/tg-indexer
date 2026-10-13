@@ -299,8 +299,8 @@ def test_a12_the_real_server_listens_on_the_loopback_bind_only(
     assert (no_token.status_code, no_token.content) == (401, b"")
     assert listed.status_code == 200
     assert {t["name"] for t in listed.json()["result"]["tools"]} == {
-        "list_chats", "list_tags", "search", "get_thread", "get_context", "suggest_tags",
-        "add_chat",
+        "list_chats", "list_tags", "search", "recent", "get_thread", "get_context",
+        "suggest_tags", "add_chat",
     }  # fmt: skip
     proc.terminate()
     output, _ = proc.communicate(timeout=10)

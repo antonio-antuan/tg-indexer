@@ -26,6 +26,7 @@ INDEXES = {
     "message_chat_date_idx": "USING btree (chat_id, date)",
     "message_chat_reply_idx": "USING btree (chat_id, reply_to_message_id)",
     "window_chat_start_idx": "USING btree (chat_id, start_date)",
+    "window_end_idx": "USING btree (end_date DESC, window_id DESC)",
     "window_message_ids_idx": "USING gin (message_ids)",
     "window_embedding_hnsw_idx": "USING hnsw (embedding vector_cosine_ops) WITH (m='16', "
     "ef_construction='128')",
@@ -49,7 +50,7 @@ def empty_url(create_database: Callable[[], str]) -> str:
 
 def test_migrate_creates_schema_and_rerun_is_noop(empty_url: str) -> None:
     with psycopg.connect(empty_url) as conn:
-        assert db.migrate(conn) == [1, 2, 3]
+        assert db.migrate(conn) == [1, 2, 3, 4]
         tables = {
             r[0]
             for r in conn.execute(
@@ -76,7 +77,7 @@ def test_migrate_creates_schema_and_rerun_is_noop(empty_url: str) -> None:
         assert fragment in str(indexdefs.get(name)), name
     assert dim == ("vector(1024)",)
     assert before == after
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
     assert ("chat", "windows_dirty_from", "bigint", "YES", None) in after
     assert ("chat", "backfill_cutoff", "timestamp with time zone", "YES", None) in after
 
@@ -86,7 +87,7 @@ def test_cli_migrate(empty_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     runner = CliRunner()
     first = runner.invoke(app, ["db", "migrate"])
     second = runner.invoke(app, ["db", "migrate"])
-    assert (first.exit_code, first.output) == (0, "applied: 0001, 0002, 0003\n")
+    assert (first.exit_code, first.output) == (0, "applied: 0001, 0002, 0003, 0004\n")
     assert (second.exit_code, second.output) == (0, "schema is up to date\n")
 
 

@@ -27,6 +27,33 @@ get_context(chat_id=<top hit>, message_id=<its first message>)
 
 `tgi selftest` runs it against the server (see the README).
 
+## What's new, and digests
+
+`search` needs a topic. For "what's new", "what happened today" or a digest, call
+`recent` instead: no query, the conversation windows with messages in a time range, newest
+first, each with only its messages inside the range.
+
+- `recent(tags=["valencia"])` is the last 24 hours by the **server's** clock; `hours=N` for
+  another span (at most 744), or `since` and optionally `until` for a fixed period (omit
+  `hours` then). Here `until` is **exclusive** and defaults to now; in `search` it is inclusive.
+- The answer gives the server's `now` and the exact range covered (`since` ≤ date < `until`,
+  UTC). Use them to say which period you summarized; don't guess the current time. `now` is
+  the clock, not proof the archive is current: messages arrive with each sync.
+- Next page: `recent(cursor=<next_cursor>)`. The cursor keeps the range and the filters, so
+  nothing else is needed (other arguments but `limit` are ignored). Continue until
+  `next_cursor` is null, even after a short or empty page. Then group by topic and
+  deduplicate by `chat_id` and `message_id` (a sync between pages can repeat a window).
+- "Today" or "yesterday" for the user means their timezone: convert its start and end to UTC
+  and pass them as `since`/`until` date-times. A date (`YYYY-MM-DD`) is a UTC day.
+- For a recurring digest, use the previous run's `until` as the next `since`: the ranges meet
+  exactly. Run it after a sync; a message stored late (a sync that was down, a new chat's
+  history) is listed by when it was posted, so a past range does not pick it up.
+- Hits show only the in-range messages; use `get_context` when the earlier part of a
+  conversation matters, and treat what it adds as background, not news.
+- An empty answer means no indexed messages in that range, not that nobody wrote: messages
+  stored by a sync but not yet in a conversation window are not listed.
+- Don't call `search` with an empty query: it is an error (`bad_argument`).
+
 ## Writing queries
 
 - **Expand and translate.** The chats mix Russian, Ukrainian, Spanish and English, and
@@ -52,8 +79,10 @@ get_context(chat_id=<top hit>, message_id=<its first message>)
 
 - `tags`: confirmed tags only; an unknown tag is the error `unknown_tag`.
 - `chat_ids`: from `list_chats`; an unknown chat is `unknown_chat`.
-- `since` / `until`: whole days in **UTC** (`YYYY-MM-DD`, both inclusive). All dates the
-  server returns are ISO 8601 in UTC; convert them for the user when local time matters.
+- `since` / `until`: a date (`YYYY-MM-DD`) is a whole day in **UTC**; a date-time
+  (`2026-10-12T18:00:00Z`) is an exact instant. In `search` both are inclusive; in `recent`
+  `until` is exclusive (see above). All dates the server returns
+  are ISO 8601 in UTC; convert them for the user when local time matters.
 - `limit`: at most 50 (default 20). `get_context`: `before + after` ≤ 100.
   `get_thread`: `limit` ≤ 50.
 

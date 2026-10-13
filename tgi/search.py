@@ -18,10 +18,14 @@ Windows are fused across legs and queries by reciprocal rank (`k = 60`). Queries
 as given: expansion is the agent's job. Logs carry counts only, never queries or text.
 """
 
+import base64
+import binascii
+import json
 import logging
 import math
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, cast
 
@@ -40,6 +44,7 @@ K = 100  # messages per query from the keyword leg, windows from the semantic le
 EF_SEARCH = 200  # hnsw.ef_search for the semantic leg (SPEC §4)
 RRF_K = 60
 MAX_LIMIT = 50  # SPEC §5.6 result bound
+MAX_RECENT_HOURS = 24 * 31  # `recent(hours=…)`: a month; longer is what search is for
 SHORT_TOKEN = 6  # tokens up to this many characters also go to the trigram leg
 TRGM_THRESHOLD = 0.5
 HIGHLIGHT_CHARS = 200
@@ -138,10 +143,13 @@ def _bound(value: date | None, end: bool) -> datetime | None:
     """The filter bound on `message.date`, `>=` for `since` and `<` for `until` (`end`).
 
     A `date` covers its whole UTC day; a `datetime` is inclusive (timestamps are whole
-    microseconds, so the exclusive bound is one microsecond later)."""
+    microseconds, so the exclusive bound is one microsecond later) and UTC when it has no
+    zone, never the session's TimeZone."""
     if value is None:
         return None
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
         return value + timedelta(microseconds=1) if end else value
     day = datetime.combine(value, time(), tzinfo=UTC)
     return day + timedelta(days=1) if end else day
@@ -478,6 +486,160 @@ def search(
     ]
     log.info("search mode=%s queries=%s legs=%s hits=%s", mode, len(queries), len(lists), len(hits))
     return hits
+
+
+@dataclass(frozen=True)
+class Recent:
+    """`recent`'s answer: the range it covered, `since` ≤ message date < `until`, the
+    server's `now`, the hits (their `score` carries no meaning here), and `next_cursor` for
+    the next page (None: no more)."""
+
+    now: datetime
+    since: datetime
+    until: datetime
+    hits: list[Hit]
+    next_cursor: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "now": self.now.astimezone(UTC).isoformat(),
+            "since": self.since.astimezone(UTC).isoformat(),
+            "until": self.until.astimezone(UTC).isoformat(),
+            "hits": [h.as_dict() for h in self.hits],
+            "next_cursor": self.next_cursor,
+        }
+
+
+def parse_when(text: str) -> date:
+    """A bound as a caller writes it: `YYYY-MM-DD` is a date (a whole UTC day), anything
+    longer an ISO date-time (`T` or a space before the time; UTC without a zone).
+    ValueError otherwise."""
+    text = text.strip()
+    return datetime.fromisoformat(text) if len(text) > 10 else date.fromisoformat(text)
+
+
+def _utc(value: date) -> datetime:
+    """A `recent` range end: a date-time is an exact instant (UTC without a zone), a date
+    the start of that UTC day."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return datetime.combine(value, time(), tzinfo=UTC)
+
+
+def _cursor(
+    lo: datetime, hi: datetime, tags: list[str] | None, chat_ids: list[int] | None,
+    end_date: datetime, window_id: int,
+) -> str:  # fmt: skip
+    """The next page: the frozen range and filters, and the last window's position. Opaque
+    to callers, who pass it back as it is."""
+    state = {"since": lo.isoformat(), "until": hi.isoformat(), "tags": tags,
+             "chat_ids": chat_ids, "end": end_date.astimezone(UTC).isoformat(),
+             "window": window_id}  # fmt: skip
+    return base64.urlsafe_b64encode(json.dumps(state, separators=(",", ":")).encode()).decode()
+
+
+def _parse_cursor(
+    cursor: str,
+) -> tuple[datetime, datetime, list[str] | None, list[int] | None, datetime, int]:
+    try:
+        state = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        if not isinstance(state, dict):
+            raise ValueError
+        moments = [datetime.fromisoformat(state[k]) for k in ("since", "until", "end")]
+        tags, chat_ids, window_id = state["tags"], state["chat_ids"], state["window"]
+
+        def whole(value: object) -> bool:  # an int, not a bool
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        def listed(value: object, ok: Callable[[object], bool]) -> bool:
+            return value is None or isinstance(value, list) and all(map(ok, value))
+
+        if (
+            any(m.tzinfo is None for m in moments)
+            or not whole(window_id)
+            or not listed(tags, lambda t: isinstance(t, str))
+            or not listed(chat_ids, whole)
+        ):
+            raise ValueError
+        return moments[0], moments[1], tags, chat_ids, moments[2], window_id
+    except (ValueError, TypeError, KeyError, binascii.Error, UnicodeDecodeError):
+        raise ValueError("cursor is not one this server returned") from None
+
+
+def recent(
+    conn: Conn,
+    *,
+    since: date | None = None,
+    until: date | None = None,
+    tags: list[str] | None = None,
+    chat_ids: list[int] | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+    now: datetime | None = None,
+) -> Recent:
+    """Conversation windows with messages posted in `since` ≤ date < `until`, newest
+    activity first: no query, so "what's new" needs no topic. Unlike `search`, `until` is
+    exclusive (a date: up to the end of that UTC day) and defaults to `now`, so consecutive
+    ranges meet without gap or overlap and nothing posted after `now` is listed.
+
+    A hit keeps only its messages inside the range (`get_context` widens it); windows are
+    ordered by their last message, then id. `next_cursor` (set when the page was full)
+    carries the range and the filters: with `cursor`, they come from it and `since`,
+    `until`, `tags` and `chat_ids` are ignored. A page can hold fewer than `limit` hits
+    while more follow (a window overlapping the range with no message inside it is
+    skipped); only `next_cursor` None means the end. Paging runs over live data: a sync
+    that moves a window's last message can make it repeat or drop out between pages.
+    Messages a sync has stored but not yet put in a window, and tombstoned ones, are not
+    listed."""
+    if not 1 <= limit <= MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_LIMIT}")
+    now = now or datetime.now(UTC)
+    after: tuple[datetime, int] | None = None
+    if cursor is not None:
+        lo, hi, tags, chat_ids, *position = _parse_cursor(cursor)
+        after = (cast(datetime, position[0]), cast(int, position[1]))
+    else:
+        if since is None:
+            raise ValueError("since is needed without a cursor")
+        lo = _utc(since)
+        hi = now if until is None else (
+            _utc(until) if isinstance(until, datetime) else _utc(until) + timedelta(days=1)
+        )  # fmt: skip
+    if lo >= hi:
+        raise BadRange("since is not before until")
+    chats = resolve_chats(conn, tags, chat_ids)
+    if chats == []:
+        return Recent(now, lo, hi, [], None)
+    filters = [sql.SQL("w.end_date >= %(lo)s"), sql.SQL("w.start_date < %(hi)s")]
+    params: dict[str, Any] = {"lo": lo, "hi": hi, "n": limit}
+    if chats is not None:
+        filters.append(sql.SQL("w.chat_id = ANY(%(chats)s)"))
+        params["chats"] = chats
+    if after is not None:
+        filters.append(sql.SQL("(w.end_date, w.window_id) < (%(c_date)s, %(c_id)s)"))
+        params["c_date"], params["c_id"] = after
+    rows = conn.execute(
+        sql.SQL(
+            'SELECT w.window_id, w.end_date FROM "window" w WHERE {}'
+            " ORDER BY w.end_date DESC, w.window_id DESC LIMIT %(n)s"
+        ).format(sql.SQL(" AND ").join(filters)),
+        params,
+    ).fetchall()
+    hits = []
+    for row in rows:
+        hit = _hit(conn, ("w", row[0]), 0.0, [], [], include_deleted=False)
+        if hit is None:
+            continue
+        inside = [m for m in hit.messages if lo <= m.date < hi]
+        if inside:
+            hits.append(replace(hit, messages=inside, start_date=inside[0].date,
+                                end_date=inside[-1].date))  # fmt: skip
+    next_cursor = None
+    if len(rows) == limit:
+        last_id, last_end = cast(int, rows[-1][0]), cast(datetime, rows[-1][1])
+        next_cursor = _cursor(lo, hi, tags, chat_ids, last_end, last_id)
+    log.info("recent windows=%s hits=%s more=%s", len(rows), len(hits), next_cursor is not None)
+    return Recent(now, lo, hi, hits, next_cursor)
 
 
 def _hit(
