@@ -159,6 +159,10 @@ uv run tgi search QUERY --include-deleted --limit 50          # tombstoned messa
 uv run tgi search QUERY --compact                             # matched messages and 2 neighbours, long texts cut
 uv run tgi recent [--hours 24 | --since … [--until …]] [--tag TAG] [--chat ID] [--json]  # what's new, no query
 uv run tgi status [--chat ID] [--json]                        # how current the archive is
+uv run tgi tags list [--json]                                 # tags with status and chat counts
+uv run tgi chats archived [--tag TAG] [--json]                # the archive's chats (not Telegram dialogs)
+uv run tgi context CHAT_ID MESSAGE [--before 10] [--after 10] [--json]  # a message and its neighbours
+uv run tgi thread CHAT_ID MESSAGE [--limit 50] [--json]       # a reply chain and its replies
 uv run tgi tags propose|confirm|remove <chat_id> <tag>      # only confirmed tags filter
 ```
 
@@ -182,6 +186,13 @@ the semantic leg did not find it). `--compact` (MCP
 `compact`) keeps each hit's matched messages and two neighbours each (the first five when only
 the semantic leg found it), cuts texts over 400 characters (marked `truncated`) and counts the
 rest in `omitted_messages`; for `tgi recent` it only cuts texts.
+
+Every MCP read tool has a CLI twin printing the same JSON with `--json`: `tgi search`
+(search), `tgi recent` (recent), `tgi status` (status), `tgi tags list` (list_tags), `tgi chats
+archived` (list_chats), `tgi context` (get_context) and `tgi thread` (get_thread), handy to check
+what an assistant was told. `MESSAGE` is a `message_id` or the number at the end of the
+message's `t.me` link (a server id; TDLib ids of server messages are that number times 2^20, so
+the two never collide). A tool error (`unknown_chat`, `bad_range`, …) exits 1 with its code.
 
 `tgi status` shows how current the archive is: whether a sync (or `embed`, `purge`, `forget`, a join)
 runs now (`sync_lock_held`), the next scheduled run

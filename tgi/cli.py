@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import typer
+from mcp.server.mcpserver.exceptions import ToolError
 from typer._click.exceptions import UsageError  # typer vendors click; no public alias
 from typer.core import TyperGroup
 
@@ -406,6 +407,27 @@ def chats_add(
     )
 
 
+@chats_app.command("archived")
+def chats_archived(
+    tag: str | None = typer.Option(None, "--tag", help="Only chats this tag is confirmed for."),
+    as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
+) -> None:
+    """The chats in the archive with confirmed tags, message counts and date range (the MCP
+    list_chats); `tgi chats list` shows the account's Telegram dialogs instead."""
+    with db.connect(_database_url()) as conn, _tool_errors():
+        rows = mcp_server.list_chats(conn, tag)
+    if as_json:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    for c in rows:
+        tags = ",".join(c["tags"]) or "-"
+        dates = f"{c['first_date'] or '-'} .. {c['last_date'] or '-'}"
+        typer.echo(
+            f"{c['chat_id']}\t{c['kind']}\t{c['title']}\ttags {tags}\t"
+            f"{c['message_count']} messages, {dates}"
+        )
+
+
 @chats_app.command("disable", context_settings=_CHAT_ID_ARGS)
 def chats_disable(chat_id: int) -> None:
     """Stop syncing a chat; its data is kept."""
@@ -444,6 +466,35 @@ def _tag_result(done: bool, missing: str) -> None:
     if not done:
         typer.echo(missing, err=True)
         raise typer.Exit(1)
+
+
+@contextmanager
+def _tool_errors() -> Iterator[None]:
+    """An MCP tool function's error (`unknown_chat`, `bad_range`, …) as exit 1 with its message."""
+    try:
+        yield
+    except ToolError as exc:
+        error = json.loads(str(exc))
+        typer.echo(f"{error['code']}: {error['message']}", err=True)
+        raise typer.Exit(1) from None
+
+
+def _print_messages(messages: list[dict[str, Any]]) -> None:
+    for m in messages:
+        typer.echo(f"{m['date']} {m['sender_name'] or '?'}: {m['text']}")
+        typer.echo(f"    {m['link'] or '(no link)'}  [message_id {m['message_id']}]")
+
+
+@tags_app.command("list")
+def tags_list(as_json: bool = typer.Option(False, "--json", help="Print as JSON.")) -> None:
+    """Each tag with each status it has and how many chats have it so (the MCP list_tags)."""
+    with db.connect(_database_url()) as conn:
+        tags = mcp_server.list_tags(conn)
+    if as_json:
+        typer.echo(json.dumps(tags, ensure_ascii=False, indent=2))
+        return
+    for t in tags:
+        typer.echo(f"{t['tag']}\t{t['status']}\t{t['chat_count']} chats")
 
 
 @tags_app.command("propose", context_settings=_CHAT_ID_ARGS)
@@ -649,6 +700,48 @@ def status_command(
             f"    last sync attempt {c['last_sync_attempt_at'] or 'never'}, waiting for embedding"
             f" {c['windows_waiting_for_embedding']}{rebuild}"
         )
+
+
+def _message_id(value: int) -> int:
+    """A TDLib message id, or the number at the end of a t.me link (a server id): TDLib ids
+    of server messages are `server_id << 20`, so a smaller number can only be a server id."""
+    return value << 20 if 0 < value < 1 << 20 else value
+
+
+_MESSAGE = typer.Argument(..., help="message_id, or the number at the end of its t.me link.")
+
+
+@app.command("context", context_settings=_CHAT_ID_ARGS)
+def context_command(
+    chat_id: int,
+    message: int = _MESSAGE,
+    before: int = typer.Option(10, "--before", min=0),
+    after: int = typer.Option(10, "--after", min=0),
+    as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
+) -> None:
+    """A message with the messages around it in its chat (the MCP get_context)."""
+    with db.connect(_database_url()) as conn, _tool_errors():
+        messages = mcp_server.get_context(conn, chat_id, _message_id(message), before, after)
+    if as_json:
+        typer.echo(json.dumps(messages, ensure_ascii=False, indent=2))
+        return
+    _print_messages(messages)
+
+
+@app.command("thread", context_settings=_CHAT_ID_ARGS)
+def thread_command(
+    chat_id: int,
+    message: int = _MESSAGE,
+    limit: int = typer.Option(50, "--limit", min=1, max=search.MAX_LIMIT),
+    as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
+) -> None:
+    """The reply chain up to the root message and the replies to it (the MCP get_thread)."""
+    with db.connect(_database_url()) as conn, _tool_errors():
+        messages = mcp_server.get_thread(conn, chat_id, _message_id(message), limit)
+    if as_json:
+        typer.echo(json.dumps(messages, ensure_ascii=False, indent=2))
+        return
+    _print_messages(messages)
 
 
 _REFERENCE = typer.Option(
