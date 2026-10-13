@@ -220,7 +220,7 @@ With a real account and a few enabled chats (a short `--years` is enough):
 - [ ] `tgi status --json` on the real archive: `sync_lock_held` true during a sync and false
       after; `last_sync_attempt_at` per chat; with `SYNC_EVERY_MINUTES` set,
       `schedule.next_run_at` is the next multiple of that interval in UTC, which matches the
-      timer when its `OnCalendar` runs in UTC (the shipped timer uses local time).
+      shipped timer (`OnCalendar=… UTC`) with `SYNC_EVERY_MINUTES=180`.
 - [ ] MCP: `tgi mcp --http` with `MCP_READ_ONLY=1` lists seven tools and never opens TDLib
       (no TDLib log lines); without it, nine. In the MCP client, the read tools carry
       `readOnlyHint: true` and `suggest_tags` and `add_chat` do not: a client marking the

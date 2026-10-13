@@ -83,8 +83,8 @@ record its end leaves its row `running`; the next run marks it `interrupted`.
 
 The budget is shared out so a long history cannot starve the rest: catch-up (new messages)
 runs first with the whole budget, the backfill stops at 80% of it (`BACKFILL_RESERVE`), and the
-sweep, the window step and embedding get the rest: at most about a fifth of the budget for
-them together, less (or nothing) when catch-up itself runs long. A Telegram flood wait the
+sweep, the window step and embedding get the rest: at least about a fifth of the budget, more
+when the backfill finishes early, less (or nothing) when catch-up itself runs long. A Telegram flood wait the
 backfill could not wait out is still honoured: the sweep waits for it within the budget or the
 run ends. A run whose backfill stopped there ends
 `time_limited` and continues the backfill next run. The budget is soft: the window step has no

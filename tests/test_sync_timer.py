@@ -1,6 +1,7 @@
 """The systemd user units for `tgi sync` (deploy/tgi-sync.service, deploy/tgi-sync.timer)."""
 
 import configparser
+import os
 import shutil
 import stat
 import subprocess
@@ -30,7 +31,7 @@ def test_the_service_runs_one_budgeted_sync_and_a_held_lock_is_no_failure() -> N
     assert s["EnvironmentFile"] == "%h/.config/tgi/.env"
     assert s["SuccessExitStatus"] == "2"  # SPEC §5.3: exit 2 = another run holds the lock
     assert int(s["TimeoutStartSec"].removesuffix("min")) > 150  # the budget is soft
-    assert timer["Timer"]["OnCalendar"] == "*-*-* 00/3:00:00"
+    assert timer["Timer"]["OnCalendar"] == "*-*-* 00/3:00:00 UTC"  # as tgi.eta estimates
     assert timer["Timer"]["Persistent"] == "true"
     assert timer["Install"]["WantedBy"] == "timers.target"
 
@@ -51,7 +52,7 @@ def test_systemd_analyze_verify_accepts_the_units(tmp_path: Path) -> None:
         (tmp_path / path.name).write_text(path.read_text())
     r = subprocess.run(  # noqa: S603 - fixed arguments, files written above
         [analyze, "verify", str(tmp_path / TIMER.name), str(tmp_path / SERVICE.name)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, env={**os.environ, "LC_ALL": "C"},
     )  # fmt: skip
     problems = [
         line for line in (r.stdout + r.stderr).splitlines()
