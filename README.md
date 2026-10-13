@@ -183,13 +183,14 @@ the semantic leg did not find it). `--compact` (MCP
 the semantic leg found it), cuts texts over 400 characters (marked `truncated`) and counts the
 rest in `omitted_messages`; for `tgi recent` it only cuts texts.
 
-`tgi status` shows how current the archive is: whether a sync runs now, the next scheduled run
+`tgi status` shows how current the archive is: whether a sync (or `embed`, `purge`, `forget`, a join)
+runs now (`sync_lock_held`), the next scheduled run
 (an estimate from `SYNC_EVERY_MINUTES`), the last run (status, counts) and the last `ok` one (a
 whole sync or a one-chat resweep, so not proof that every chat is current), how many
 conversation windows wait for a new embedding (meaning-based search has none, or an outdated
-one, for them), and per chat: when its last sync turn ended (complete, cut short or failed),
-whether its history is fetched back to its current lookback (a deeper `--years` makes it
-incomplete at once), its oldest and newest stored message, whether stored messages still wait
+one, for them), and per chat: when its last sync turn ended (`last_sync_attempt_at`: complete, cut short or failed),
+whether its history is fetched back to its current lookback (`history_cutoff`; a deeper
+`--years` makes it incomplete at once), its oldest and newest stored message, whether stored messages still wait
 for the window step (a rebuild is pending: `recent` and meaning-based results may be incomplete
 or outdated; keyword search finds the stored messages), and its windows waiting for an embedding. No
 account phones are shown.

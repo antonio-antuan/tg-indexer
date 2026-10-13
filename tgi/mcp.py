@@ -656,14 +656,15 @@ def build_server(
     @server.tool(name="status", annotations=READ_ONLY)
     def status_tool(chat_ids: list[Int] | None = None) -> dict[str, Any]:
         """How current the archive is, to tell "not fetched yet" from "nothing found":
-        `sync_running`, the `schedule` (next run estimated), the last run and the last `ok`
-        one (a whole sync or a one-chat resweep), windows waiting for a new embedding
-        (meaning-based search has none or an outdated one for them), and per chat
-        `last_sync_at` (its last sync turn, complete, cut short or failed),
-        `history_complete` (fetched back to its lookback), `oldest_message_at`,
-        `newest_message_at`, `windows_need_rebuild` (a window rebuild is pending: `recent`
-        and meaning-based results may be incomplete or outdated; keyword search finds the
-        stored messages) and `windows_waiting_for_embedding`. Dates UTC."""
+        `sync_lock_held` (a sync, embed, purge or join runs), the `schedule` (next run
+        estimated), the last run and the last `ok` one (a whole sync or a one-chat
+        resweep), windows waiting for a new embedding (meaning-based search has none or an
+        outdated one for them), and per chat `last_sync_attempt_at` (its last sync turn,
+        complete, cut short or failed), `history_complete` (fetched back to
+        `history_cutoff`, its lookback), `oldest_message_at`, `newest_message_at`,
+        `windows_need_rebuild` (a window rebuild is pending: `recent` and meaning-based
+        results may be incomplete or outdated; keyword search finds the stored messages)
+        and `windows_waiting_for_embedding`. Dates UTC."""
 
         def answer(conn: Conn) -> dict[str, Any]:
             if chat_ids:

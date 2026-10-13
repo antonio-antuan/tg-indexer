@@ -22,8 +22,9 @@ def _iso(value: object) -> str | None:
     return None if value is None else cast(datetime, value).astimezone(UTC).isoformat()
 
 
-def sync_running(conn: Conn) -> bool:
-    """Whether a `tgi sync` (or `embed`, `purge`, `forget`, `chats add`) holds the lock now.
+def sync_lock_held(conn: Conn) -> bool:
+    """Whether the sync lock is held now: by `tgi sync`, or by `embed`, `purge`, `forget`,
+    `chats add` / `add_chat`, which share it.
 
     Read from `pg_locks` rather than by trying the lock, which would block it for a moment.
     A one-key advisory lock below 2^32 has `classid` 0, `objid` the key, `objsubid` 1; the
@@ -62,12 +63,13 @@ def status(
     `default_years` (`BACKFILL_YEARS`) is the lookback of a chat without its own;
     `sync_every_minutes` (`SYNC_EVERY_MINUTES`) the host's schedule, 0 when unknown.
 
-    `last_sync_at` is when the chat's turn in a run last ended: completed, cut short by the
-    budget or a flood wait, or failed. `history_complete` is whether the backfill reached
-    the chat's current lookback (a deeper lookback set since makes it false at once, before
-    the next sync reopens it). `windows_need_rebuild` means a window rebuild is pending (new,
-    edited or deleted messages, a renamed chat): `recent` and the semantic leg may be
-    incomplete or outdated for that chat; keyword search finds the stored messages.
+    `last_sync_attempt_at` is when the chat's turn in a run last ended: completed, cut
+    short by the budget or a flood wait, or failed. `history_complete` is whether the
+    backfill reached the chat's current lookback, `history_cutoff` (a deeper lookback set
+    since makes it false at once, before the next sync reopens it). `windows_need_rebuild`
+    means a window rebuild is pending (new, edited or deleted messages, a renamed chat):
+    `recent` and the semantic leg may be incomplete or outdated for that chat; keyword
+    search finds the stored messages.
     `last_ok_run` is the latest run that ended `ok`: a whole sync or a single-chat resweep,
     so not proof that every chat is current."""
     now = (now or datetime.now(UTC)).astimezone(UTC)
@@ -104,8 +106,9 @@ def status(
             "kind": r[2],
             "enabled": r[3],
             "tags": r[4],
-            "last_sync_at": _iso(r[5]),
+            "last_sync_attempt_at": _iso(r[5]),
             "history_complete": complete,
+            "history_cutoff": None if years is None else years_before(now, years).isoformat(),
             "backfill_years": years,
             "oldest_message_at": _iso(r[10]),
             "newest_message_at": _iso(r[11]),
@@ -115,7 +118,7 @@ def status(
     upcoming = next_run(now, sync_every_minutes)
     return {
         "now": now.isoformat(),
-        "sync_running": sync_running(conn),
+        "sync_lock_held": sync_lock_held(conn),
         "schedule": {
             "every_minutes": sync_every_minutes or None,
             "next_run_at": None if upcoming is None else upcoming.isoformat(),  # an estimate

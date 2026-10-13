@@ -622,7 +622,8 @@ def status_command(
         typer.echo(json.dumps(answer, ensure_ascii=False, indent=2))
         return
     last, ok = answer["last_run"], answer["last_ok_run"]
-    typer.echo("sync running now" if answer["sync_running"] else "no sync running")
+    held = answer["sync_lock_held"]
+    typer.echo("a sync (or embed, purge, forget, join) is running" if held else "nothing running")
     if (upcoming := answer["schedule"]["next_run_at"]) is not None:
         typer.echo(f"next scheduled run (estimate): {upcoming}")
     if last is None:
@@ -640,11 +641,12 @@ def status_command(
         rebuild = ", messages wait for the window step" if c["windows_need_rebuild"] else ""
         typer.echo(f"{'*' if c['enabled'] else ' '} {c['chat_id']}  {c['title']}")
         typer.echo(
-            f"    history {history} ({c['backfill_years']}y, oldest"
+            f"    history {history} ({c['backfill_years']}y, to {c['history_cutoff'] or '-'};"
+            f" oldest"
             f" {c['oldest_message_at'] or '-'}), newest {c['newest_message_at'] or '-'}"
         )
         typer.echo(
-            f"    last sync turn {c['last_sync_at'] or 'never'}, waiting for embedding"
+            f"    last sync attempt {c['last_sync_attempt_at'] or 'never'}, waiting for embedding"
             f" {c['windows_waiting_for_embedding']}{rebuild}"
         )
 

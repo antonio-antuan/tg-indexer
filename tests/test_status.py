@@ -38,7 +38,7 @@ def by_chat(answer: dict) -> dict[int, dict]:  # type: ignore[type-arg]
 
 def test_status_reports_runs_chats_and_the_embedding_backlog(archive: None, conn: Conn) -> None:
     answer = status.status(conn, now=NOW, default_years=3)
-    assert answer["now"] == NOW.isoformat() and answer["sync_running"] is False
+    assert answer["now"] == NOW.isoformat() and answer["sync_lock_held"] is False
     assert answer["last_run"]["status"] == "ok"
     assert answer["last_run"]["stats"]["upserted"] == 35
     assert answer["last_ok_run"] == answer["last_run"]
@@ -48,7 +48,8 @@ def test_status_reports_runs_chats_and_the_embedding_backlog(archive: None, conn
     assert a["newest_message_at"] == NOW.isoformat()
     assert a["oldest_message_at"] == (NOW - timedelta(hours=29)).isoformat()
     assert (a["backfill_years"], b["backfill_years"]) == (3, 2)  # default vs the chat's own
-    assert a["last_sync_at"] is not None
+    assert a["history_cutoff"] == NOW.replace(year=NOW.year - 3).isoformat()
+    assert a["last_sync_attempt_at"] is not None
 
 
 def test_status_shows_pending_embeddings_and_an_incomplete_run(archive: None, conn: Conn) -> None:
@@ -64,8 +65,8 @@ def test_status_shows_pending_embeddings_and_an_incomplete_run(archive: None, co
 
 def test_status_sees_a_running_sync(archive: None, conn: Conn, db_url: str) -> None:
     with psycopg.connect(db_url) as other, ingest.sync_lock(other):
-        assert status.status(conn)["sync_running"] is True
-    assert status.status(conn)["sync_running"] is False
+        assert status.status(conn)["sync_lock_held"] is True
+    assert status.status(conn)["sync_lock_held"] is False
 
 
 def test_status_filters_chats_and_never_shows_the_account(archive: None, conn: Conn) -> None:
@@ -119,12 +120,12 @@ def test_a_lock_in_another_database_is_not_a_running_sync(
     archive: None, conn: Conn, create_database: Callable[[], str]
 ) -> None:
     with psycopg.connect(create_database()) as elsewhere, ingest.sync_lock(elsewhere):
-        assert status.status(conn)["sync_running"] is False
+        assert status.status(conn)["sync_lock_held"] is False
 
 
 def test_the_connection_holding_the_lock_sees_it(archive: None, conn: Conn) -> None:
     with ingest.sync_lock(conn):
-        assert status.status(conn)["sync_running"] is True
+        assert status.status(conn)["sync_lock_held"] is True
 
 
 def test_dates_skip_tombstones_and_tags_skip_proposals(archive: None, conn: Conn) -> None:
