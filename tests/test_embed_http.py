@@ -123,8 +123,8 @@ def test_provider_config() -> None:
     custom = Settings(embed_provider="voyage", voyage_api_key="k", embed_model="voyage-4-lite")
     assert embed.provider(custom).model == "voyage-4-lite"
     assert embed.provider(Settings(embed_provider="fake")).tokens_used == 0
-    assert Settings().embed_provider == "voyage"  # SPEC §3
-    assert Settings.from_env({}).embed_provider == "voyage"
+    assert Settings().embed_provider == "openai"  # SPEC §3 (v1.12)
+    assert Settings.from_env({}).embed_provider == "openai"
     for name, key in (("voyage", "VOYAGE_API_KEY"), ("openai", "OPENAI_API_KEY")):
         with pytest.raises(ValueError, match=f"{key} is not set"):  # at construction time
             embed.provider(Settings(embed_provider=name))

@@ -96,7 +96,7 @@ class Settings:
     window_gap_min: int = 30
     window_max_chars: int = 1500
     window_max_msgs: int = 40
-    embed_provider: str = "voyage"  # SPEC §3; tests use "fake"
+    embed_provider: str = "openai"  # SPEC §3 (v1.12; voyage before); tests use "fake"
     embed_model: str | None = None
     voyage_api_key: str | None = field(default=None, repr=False)
     openai_api_key: str | None = field(default=None, repr=False)
@@ -130,7 +130,7 @@ class Settings:
             window_gap_min=_int(env, "WINDOW_GAP_MIN", 30),
             window_max_chars=_int(env, "WINDOW_MAX_CHARS", 1500),
             window_max_msgs=_int(env, "WINDOW_MAX_MSGS", 40),
-            embed_provider=_str(env, "EMBED_PROVIDER") or "voyage",
+            embed_provider=_str(env, "EMBED_PROVIDER") or "openai",
             embed_model=_str(env, "EMBED_MODEL"),
             voyage_api_key=_str(env, "VOYAGE_API_KEY"),
             openai_api_key=_str(env, "OPENAI_API_KEY"),

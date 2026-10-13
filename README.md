@@ -117,10 +117,12 @@ are marked `stale` for embedding. Window caps: `WINDOW_GAP_MIN` (30), `WINDOW_MA
 Then, within the same time budget, `stale` windows are embedded, newest first (so with a backlog,
 after a first import, a reindex or a provider outage, the latest conversations become searchable by
 meaning before older history), in batches of 64 with the
-`EMBED_PROVIDER`: `voyage` (the default; `VOYAGE_API_KEY`, `EMBED_MODEL` default
-`voyage-4`), `openai` (`OPENAI_API_KEY`, default `text-embedding-3-small`) or `fake`
+`EMBED_PROVIDER`: `openai` (the default since SPEC v1.12; `OPENAI_API_KEY`, `EMBED_MODEL`
+default `text-embedding-3-small`), `voyage` (`VOYAGE_API_KEY`, default `voyage-4`) or `fake`
 (deterministic token-hash vectors, what the tests use), all 1024 dims. A missing or empty key is a usage error (exit 1,
-`VOYAGE_API_KEY is not set`) before anything runs. The HTTP providers use the environment's proxy and `SSL_CERT_FILE`
+e.g. `OPENAI_API_KEY is not set`) before anything runs. An archive embedded with Voyage under the old
+default keeps working only with `EMBED_PROVIDER=voyage` set explicitly; otherwise searches and syncs
+report `model_mismatch` until `tgi embed --reindex`. The HTTP providers use the environment's proxy and `SSL_CERT_FILE`
 settings; a 429 with `Retry-After` up to 30 s is waited out once, anything else fails the
 batch. `tgi embed --max-windows N` embeds at most N windows (a cheap first try with a paid
 provider) and prints the `tokens=` the provider billed. A
