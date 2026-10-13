@@ -121,8 +121,8 @@ meaning before older history), in batches of 64 with the
 default `text-embedding-3-small`), `voyage` (`VOYAGE_API_KEY`, default `voyage-4`) or `fake`
 (deterministic token-hash vectors, what the tests use), all 1024 dims. A missing or empty key is a usage error (exit 1,
 e.g. `OPENAI_API_KEY is not set`) before anything runs. An archive embedded with Voyage under the old
-default keeps working only with `EMBED_PROVIDER=voyage` set explicitly; otherwise searches and syncs
-report `model_mismatch` until `tgi embed --reindex`. The HTTP providers use the environment's proxy and `SSL_CERT_FILE`
+default keeps working only with `EMBED_PROVIDER=voyage` set explicitly; with OpenAI configured
+instead (and its key set), searches and syncs report `model_mismatch` until `tgi embed --reindex`. The HTTP providers use the environment's proxy and `SSL_CERT_FILE`
 settings; a 429 with `Retry-After` up to 30 s is waited out once, anything else fails the
 batch. `tgi embed --max-windows N` embeds at most N windows (a cheap first try with a paid
 provider) and prints the `tokens=` the provider billed. A
@@ -163,7 +163,7 @@ uv run tgi recent [--hours 24 | --since … [--until …]] [--tag TAG] [--chat I
 uv run tgi status [--chat ID] [--json]                        # how current the archive is
 uv run tgi tags list [--json]                                 # tags with status and chat counts
 uv run tgi chats archived [--tag TAG] [--json]                # the archive's chats (not Telegram dialogs)
-uv run tgi context CHAT_ID MESSAGE [--before 10] [--after 10] [--json]  # a message and its neighbours
+uv run tgi context CHAT_ID MESSAGE [--before 10] [--after 10] [--json]  # MESSAGE: an id or its t.me link
 uv run tgi thread CHAT_ID MESSAGE [--limit 50] [--json]       # a reply chain and its replies
 uv run tgi tags propose|confirm|remove <chat_id> <tag>      # only confirmed tags filter
 ```
@@ -192,9 +192,12 @@ rest in `omitted_messages`; for `tgi recent` it only cuts texts.
 Every MCP read tool has a CLI twin printing the same JSON with `--json`: `tgi search`
 (search), `tgi recent` (recent), `tgi status` (status), `tgi tags list` (list_tags), `tgi chats
 archived` (list_chats), `tgi context` (get_context) and `tgi thread` (get_thread), handy to check
-what an assistant was told. `MESSAGE` is a `message_id` or the number at the end of the
-message's `t.me` link (a server id; TDLib ids of server messages are that number times 2^20, so
-the two never collide). A tool error (`unknown_chat`, `bad_range`, …) exits 1 with its code.
+what an assistant was told. `MESSAGE` is a `message_id` as the tools return it, or the
+message's `t.me` link (`https://t.me/name/123`, `https://t.me/c/1234567890/123`): its last
+number is the server id, and the TDLib id is that times 2^20. A link must be the given chat's
+(its username, or its id without `-100`); another chat's link is `bad_argument`. Unknown tags or chats and other
+tool errors (`unknown_chat`, `bad_range`, …) exit 1 with their code, as the tools answer;
+the one difference is `tgi search` reporting an embedding failure or model mismatch as exit 3.
 
 `tgi status` shows how current the archive is: whether a sync (or `embed`, `purge`, `forget`, a join)
 runs now (`sync_lock_held`), the next scheduled run
@@ -368,10 +371,14 @@ Any MCP client works; `docs/AGENT-NOTES.md` is the guidance to give the agent.
 
 - **Backups.** The archive is the Docker volume `pgdata`, not `DATA_DIR`. Back it up with
   `docker compose exec -T db pg_dump -U tgi -Fc tgi > <private path>/tgi.dump` and test a
-  restore once (`pg_restore -d <empty database>`). The dump holds every archived message: keep
+  restore once into an empty database, e.g. `docker compose exec -T db createdb -U tgi
+  tgi_restore` then `docker compose exec -T db pg_restore -U tgi -d tgi_restore <
+  <private path>/tgi.dump`. The dump holds every archived message: keep
   it private. `DATA_DIR/accounts` (the TDLib sessions) stays out of backups by design: after a
   loss, log in again with `tgi accounts add`.
-- **Upgrades.** Stop the timer and the MCP service, pull, `uv sync`, then `tgi db migrate`
+- **Upgrades.** Stop the timer and the MCP service and wait for a running sync to end
+  (`tgi status --json`: `sync_lock_held` false; stopping the timer does not stop a run), pull,
+  `uv sync`, then `tgi db migrate`
   (it never runs by itself; migration 0004 builds an index that blocks window writes while it
   runs, so migrate while no sync runs), restart, and check `tgi status`.
 - **Another embedding model or provider** means `tgi embed --reindex`: every embedding is

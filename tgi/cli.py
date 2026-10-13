@@ -479,6 +479,21 @@ def _tool_errors() -> Iterator[None]:
         raise typer.Exit(1) from None
 
 
+def _tool_exit(code: str, exc: Exception) -> typer.Exit:
+    """Exit 1 with `code: message`, as `_tool_errors` reports a tool's error."""
+    typer.echo(f"{code}: {exc}", err=True)
+    return typer.Exit(1)
+
+
+def _check_filters(conn: Any, tags: list[str] | None, chat_ids: list[int] | None) -> None:
+    """Unknown tags and chats are errors, as in the MCP tools (`unknown_tag`, exit 1)."""
+    with _tool_errors():
+        if tags:
+            mcp_server._check_tags(conn, tags)
+        if chat_ids:
+            mcp_server._check_chats(conn, chat_ids)
+
+
 def _print_messages(messages: list[dict[str, Any]]) -> None:
     for m in messages:
         typer.echo(f"{m['date']} {m['sender_name'] or '?'}: {m['text']}")
@@ -563,6 +578,7 @@ def search_command(
         raise typer.BadParameter("--mode must be hybrid, keyword or semantic")
     try:
         with db.connect(_database_url()) as conn:
+            _check_filters(conn, tag, chat)
             hits = search.search(
                 conn,
                 queries,
@@ -578,8 +594,10 @@ def search_command(
     except (search.EmbedderUnavailable, search.ModelMismatch) as exc:
         typer.echo(f"search failed: {exc}", err=True)
         raise typer.Exit(3) from None
-    except ValueError as exc:  # bad range, empty queries
-        raise typer.BadParameter(str(exc)) from None
+    except search.BadRange as exc:
+        raise _tool_exit("bad_range", exc) from None
+    except ValueError as exc:  # empty queries
+        raise _tool_exit("bad_argument", exc) from None
     if as_json:
         typer.echo(json.dumps([h.as_dict() for h in hits], ensure_ascii=False, indent=2))
         return
@@ -625,15 +643,17 @@ def recent_command(
     --until is exclusive and defaults to now. --cursor continues a listing: it keeps the
     range and filters, so the other options but --limit are ignored with it."""
     if cursor is None and hours is not None and since is not None:
-        raise typer.BadParameter("give --hours or --since, not both")
+        raise _tool_exit("bad_argument", ValueError("give --hours or --since, not both"))
     if cursor is None and until is not None and since is None:
-        raise typer.BadParameter("--until needs --since")
+        raise _tool_exit("bad_argument", ValueError("--until needs --since"))
     now = datetime.now(UTC)
     if cursor is not None:  # the cursor carries the range: --since/--until are not read
         since = until = None
     start = None if cursor else _when(since, "--since") or now - timedelta(hours=hours or 24)
     try:
         with db.connect(_database_url()) as conn:
+            if cursor is None:  # the cursor's filters were checked when it was made
+                _check_filters(conn, tag, chat)
             answer = search.recent(
                 conn,
                 since=start,
@@ -645,8 +665,10 @@ def recent_command(
                 now=now,
                 compact=compact,
             )
-    except ValueError as exc:  # bad range, a cursor this tool did not print
-        raise typer.BadParameter(str(exc)) from None
+    except search.BadRange as exc:
+        raise _tool_exit("bad_range", exc) from None
+    except ValueError as exc:  # a cursor this tool did not print
+        raise _tool_exit("bad_argument", exc) from None
     if as_json:
         typer.echo(json.dumps(answer.as_dict(), ensure_ascii=False, indent=2))
         return
@@ -667,6 +689,7 @@ def status_command(
     """How current the archive is: runs, embedding backlog, per chat history and last sync."""
     settings = _settings()
     with db.connect(_database_url()) as conn:
+        _check_filters(conn, None, chat)
         answer = status.status(conn, chat or None, default_years=settings.backfill_years,
                                sync_every_minutes=settings.sync_every_minutes)  # fmt: skip
     if as_json:
@@ -702,26 +725,60 @@ def status_command(
         )
 
 
-def _message_id(value: int) -> int:
-    """A TDLib message id, or the number at the end of a t.me link (a server id): TDLib ids
-    of server messages are `server_id << 20`, so a smaller number can only be a server id."""
-    return value << 20 if 0 < value < 1 << 20 else value
+# A message link: t.me/<username>/<n> (also t.me/s/<username>/<n>, the web preview) or
+# t.me/c/<chat>/<n>, each with an optional topic id before <n> and an optional "/".
+_LINK = re.compile(
+    r"(?:https?://)?t\.me/(?:c/(?P<internal>\d+)|(?:s/)?(?P<user>[A-Za-z][A-Za-z0-9_]{3,31}))"
+    r"(?:/\d+)?/(?P<id>\d+)/?(?:[?#].*)?"
+)
+Ref = tuple[int, str | None, int | None]  # message_id, a link's username or internal chat id
 
 
-_MESSAGE = typer.Argument(..., help="message_id, or the number at the end of its t.me link.")
+def _message_ref(value: str) -> Ref:
+    """A `message_id` as tools return it, or a t.me message link: its last number is the
+    server id, and TDLib ids of server messages are `server_id << 20`. Which chat a link
+    names is checked against the chat (`_check_link`), not against a list of t.me paths."""
+    text = value.strip()
+    if re.fullmatch(r"-?\d+", text):
+        return int(text), None, None
+    if m := _LINK.fullmatch(text):
+        return int(m["id"]) << 20, m["user"], int(m["internal"]) if m["internal"] else None
+    raise typer.BadParameter("must be a message_id or a t.me message link", param_hint="MESSAGE")
+
+
+def _check_link(conn: Any, chat_id: int, ref: Ref) -> None:
+    """A link must be one of `chat_id`'s: its username, or its id without -100 (/c/ links).
+    t.me's own paths (joinchat, call, …) and another chat's links are `bad_argument`."""
+    _, user, internal = ref
+    if user is None and internal is None:
+        return
+    row = conn.execute("SELECT username FROM chat WHERE chat_id = %s", (chat_id,)).fetchone()
+    if row is None:
+        return  # the tool answers unknown_chat
+    username = cast(str | None, row[0])
+    if user is not None and username is not None and user.lower() == username.lower():
+        return
+    if internal is not None and internal == -chat_id - 10**12:
+        return
+    raise _tool_exit("bad_argument", ValueError("the link is not a message of this chat"))
+
+
+_MESSAGE = typer.Argument(..., help="A message_id, or the message's t.me link.")
 
 
 @app.command("context", context_settings=_CHAT_ID_ARGS)
 def context_command(
     chat_id: int,
-    message: int = _MESSAGE,
+    message: str = _MESSAGE,
     before: int = typer.Option(10, "--before", min=0),
     after: int = typer.Option(10, "--after", min=0),
     as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
 ) -> None:
     """A message with the messages around it in its chat (the MCP get_context)."""
+    ref = _message_ref(message)
     with db.connect(_database_url()) as conn, _tool_errors():
-        messages = mcp_server.get_context(conn, chat_id, _message_id(message), before, after)
+        _check_link(conn, chat_id, ref)
+        messages = mcp_server.get_context(conn, chat_id, ref[0], before, after)
     if as_json:
         typer.echo(json.dumps(messages, ensure_ascii=False, indent=2))
         return
@@ -731,13 +788,15 @@ def context_command(
 @app.command("thread", context_settings=_CHAT_ID_ARGS)
 def thread_command(
     chat_id: int,
-    message: int = _MESSAGE,
+    message: str = _MESSAGE,
     limit: int = typer.Option(50, "--limit", min=1, max=search.MAX_LIMIT),
     as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
 ) -> None:
     """The reply chain up to the root message and the replies to it (the MCP get_thread)."""
+    ref = _message_ref(message)
     with db.connect(_database_url()) as conn, _tool_errors():
-        messages = mcp_server.get_thread(conn, chat_id, _message_id(message), limit)
+        _check_link(conn, chat_id, ref)
+        messages = mcp_server.get_thread(conn, chat_id, ref[0], limit)
     if as_json:
         typer.echo(json.dumps(messages, ensure_ascii=False, indent=2))
         return

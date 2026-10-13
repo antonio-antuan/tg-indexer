@@ -96,7 +96,7 @@ no Docker network and no Nano container. With `.env` loaded (`set -a; . ./.env; 
 (Since v1.12 `EMBED_PROVIDER` defaults to `openai`: for Voyage set `EMBED_PROVIDER=voyage`;
 for OpenAI run the same steps with `OPENAI_API_KEY` and read the usage on its dashboard.)
 In P2, `EMBED_PROVIDER` defaulted to `voyage`. A `.env` copied from the P1 `.env.example` still
-says `EMBED_PROVIDER=fake`; set it to `voyage` (or remove the line). `VOYAGE_API_KEY` is the
+says `EMBED_PROVIDER=fake`; set it to `voyage` (since v1.12 removing the line selects `openai`). `VOYAGE_API_KEY` is the
 real key, or any non-empty placeholder when `api.voyageai.com` goes through the OneCLI
 proxy. Left empty, as in `.env.example`, `tgi embed` stops with `VOYAGE_API_KEY is not set`
 (exit 1).
@@ -199,10 +199,16 @@ With a real account and a few enabled chats (a short `--years` is enough):
 
 - [ ] `tgi embed --max-windows 5` with the default `EMBED_PROVIDER=openai` embeds five
       windows and prints `tokens=`; the OpenAI usage page shows the matching spend.
-- [ ] A first sync of a chat with a long history ends `time_limited` with the backfill
-      unfinished, yet the run stats show a sweep and `embedded` > 0 (`BACKFILL_RESERVE`);
-      `tgi status` shows `history_complete: false` for it and a falling
-      `waiting_for_embedding` over the next runs.
+- [ ] A first sync of a chat with a long history and a budget too short to fetch it all
+      (e.g. `--max-minutes 5`, with a working embedding key) ends `time_limited` with the
+      backfill unfinished, and the run still reaches the steps after it. To see the sweep, let a
+      first run archive the chat's recent messages, then delete one of the account's own
+      messages from the last few days there and run again while the backfill is still
+      unfinished: that run's stats show `tombstoned` ≥ 1. The stats also show `windows_rebuilt` > 0, and
+      `embedded` > 0 when the sweep left part of the reserve (a long catch-up or sweep can use it
+      all). `tgi status --json` shows
+      `history_complete: false` for it, and `windows.waiting_for_embedding` falls over the next
+      runs.
 - [ ] `deploy/tgi-sync.service` and `tgi-sync.timer` installed as user units:
       `systemctl --user list-timers` shows the next run; a run started while a sync holds the
       lock ends as success (exit 2); `journalctl --user -u tgi-sync` shows the printed stats.
@@ -211,13 +217,15 @@ With a real account and a few enabled chats (a short `--years` is enough):
 - [ ] `tgi recent --hours 24` lists real conversations newest first with working links;
       `--cursor` from the printed `more:` line continues without repeats; `tgi search
       … --compact` shows `matched_by` and cut texts.
-- [ ] `tgi status` on the real archive: `sync_lock_held` true during a sync and false after;
-      `last_sync_attempt_at` per chat; `schedule.next_run_at` matches the timer when
-      `SYNC_EVERY_MINUTES` is set.
+- [ ] `tgi status --json` on the real archive: `sync_lock_held` true during a sync and false
+      after; `last_sync_attempt_at` per chat; with `SYNC_EVERY_MINUTES` set,
+      `schedule.next_run_at` is the next multiple of that interval in UTC, which matches the
+      timer when its `OnCalendar` runs in UTC (the shipped timer uses local time).
 - [ ] MCP: `tgi mcp --http` with `MCP_READ_ONLY=1` lists seven tools and never opens TDLib
       (no TDLib log lines); without it, nine. In the MCP client, the read tools carry
-      `readOnlyHint: true` and `add_chat` does not (a client marking the server untrusted asks
-      before `add_chat` only).
+      `readOnlyHint: true` and `suggest_tags` and `add_chat` do not: a client marking the
+      server untrusted asks before either (with README's Hermes list, which leaves
+      `suggest_tags` out, before `add_chat` only).
 - [ ] An assistant over MCP answers a "what's new in <tag>" request with `recent` (not an
       empty `search`) and states the period from the answer's `now`.
 
