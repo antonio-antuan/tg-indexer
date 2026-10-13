@@ -114,7 +114,9 @@ messages changed, from the window holding the lowest changed message onward
 are marked `stale` for embedding. Window caps: `WINDOW_GAP_MIN` (30), `WINDOW_MAX_CHARS`
 (1500), `WINDOW_MAX_MSGS` (40).
 
-Then, within the same time budget, `stale` windows are embedded in batches of 64 with the
+Then, within the same time budget, `stale` windows are embedded, newest first (so with a backlog,
+after a first import, a reindex or a provider outage, the latest conversations become searchable by
+meaning before older history), in batches of 64 with the
 `EMBED_PROVIDER`: `voyage` (the default; `VOYAGE_API_KEY`, `EMBED_MODEL` default
 `voyage-4`), `openai` (`OPENAI_API_KEY`, default `text-embedding-3-small`) or `fake`
 (deterministic token-hash vectors, what the tests use), all 1024 dims. A missing or empty key is a usage error (exit 1,

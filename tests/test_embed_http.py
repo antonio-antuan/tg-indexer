@@ -173,25 +173,25 @@ def test_a_second_429_raises() -> None:
 
 
 def test_a_long_429_leaves_that_batch_stale(conn: Conn) -> None:
-    windows(conn, 70)  # batches 1-64 and 65-70
+    windows(conn, 70)  # newest first: batches 70-7 and 6-1
     api, sleeps = Api([(429, {"Retry-After": "61"})]), []
     counts = embed.embed_stale(conn, voyage(api, retry_after_max=30, sleep=sleeps.append))
     assert counts == {"embedded": 6, "embed_failed": 64, "embed_stopped": 0}
-    assert sleeps == [] and stale(conn) == list(range(1, 65))
+    assert sleeps == [] and stale(conn) == list(range(7, 71))
 
 
 def test_a_500_leaves_exactly_that_batch_stale_and_the_run_ok(
     conn: Conn, caplog: pytest.LogCaptureFixture
 ) -> None:
     msgs = hourly(150, "SECRET {i}")
-    msgs[99]["text"] = "SECRET boom"  # window 100, in the second batch (65-128)
+    msgs[49]["text"] = "SECRET boom"  # window 50, in the second batch (newest first: 86-23)
     td = FakeTdClient({"chats": [chat(A, msgs)], "runs": [{}]})
     enable(conn, td, A)
     caplog.set_level(logging.DEBUG)
     result = sync(conn, td, voyage(Api(fail_on="boom")))
     assert (result.status, result.stats["embedded"], result.stats["embed_failed"]) == (
         "ok", 86, 64)  # fmt: skip
-    assert stale(conn) == list(range(65, 129))
+    assert stale(conn) == list(range(23, 87))
     assert conn.execute("SELECT status FROM sync_run").fetchall() == [("ok",)]
     assert "SECRET" not in caplog.text
     assert any(r.getMessage() == "embed provider 500 for 64 texts" for r in caplog.records)
@@ -268,7 +268,7 @@ def test_cli_embed_max_windows(conn: Conn, db_url: str, monkeypatch: pytest.Monk
     out = cli.invoke(app, ["embed", "--max-windows", "3"])
     assert out.exit_code == 0, out.stderr
     assert out.stdout.strip() == f"embedded=3 embed_failed=0 tokens={3 * TOKENS_PER_TEXT}"
-    assert sorted(embeddings(conn)) == [1, 2, 3] and stale(conn) == list(range(4, 11))
+    assert sorted(embeddings(conn)) == [8, 9, 10] and stale(conn) == list(range(1, 8))  # newest
     assert [len(b["input"]) for _, b in api.requests] == [3]
     assert cli.invoke(app, ["embed", "--max-windows", "0"]).exit_code == 1
 
@@ -319,4 +319,4 @@ def test_embed_stale_max_windows_spans_batches(conn: Conn) -> None:
 
     counts = embed.embed_stale(conn, Counting(), max_windows=100)
     assert counts["embedded"] == 100 and rec == [64, 36]
-    assert stale(conn) == list(range(101, 151))
+    assert stale(conn) == list(range(1, 51))  # the newest 100 are embedded

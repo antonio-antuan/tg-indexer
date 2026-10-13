@@ -148,7 +148,7 @@ def test_any_bad_answer_leaves_only_that_batch_stale(conn: Conn, bad: Any) -> No
     v = custom(handler)
     counts = embed.embed_stale(conn, v)
     assert counts == {"embedded": 6, "embed_failed": 64, "embed_stopped": 0}
-    assert stale(conn) == list(range(1, 65)) and v.tokens_used in (
+    assert stale(conn) == list(range(7, 71)) and v.tokens_used in (  # newest first: 70-7 failed
         7,
         8,
     )  # a rejected 200 was still billed: counted
@@ -231,7 +231,7 @@ def test_max_windows_with_reindex(conn: Conn, db_url: str, monkeypatch: pytest.M
     assert out.exit_code == 0, out.stderr
     assert out.stdout.strip() == "dropped=10 embedded=3 embed_failed=0 tokens=15"
     assert {r[0] for r in embeddings(conn).values()} == {"voyage-4"} and len(embeddings(conn)) == 3
-    assert stale(conn) == list(range(4, 11))
+    assert stale(conn) == list(range(1, 8))  # newest first: 10, 9, 8 were embedded
     out = cli.invoke(app, ["embed", "--max-windows", "4"])  # a plain run continues, no mismatch
     assert out.exit_code == 0 and out.stdout.strip() == "embedded=4 embed_failed=0 tokens=20"
     out = cli.invoke(app, ["embed"])
