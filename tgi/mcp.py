@@ -29,7 +29,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import CallToolResult, InputRequiredResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, BeforeValidator, Strict, ValidationError
 
-from tgi import chats, db, eta, ingest, search, td
+from tgi import chats, db, eta, ingest, search, status, td
 from tgi.config import Settings, check_years
 from tgi.embed import Embedder
 from tgi.ingest import Conn
@@ -558,7 +558,7 @@ def build_server(
     sync_every_minutes: int = 0,
     read_only: bool = False,
 ) -> MCPServer:
-    """The eight tools, or with `read_only` (`MCP_READ_ONLY`) the six that only read:
+    """The nine tools, or with `read_only` (`MCP_READ_ONLY`) the seven that only read:
     `suggest_tags` and `add_chat` are then not registered at all, whatever a client asks.
     `embedder` replaces the configured provider (tests); `telegram` opens the account
     `add_chat` joins with (none: the tool answers `not_configured`); `default_years` is
@@ -635,6 +635,26 @@ def build_server(
         return connected(
             lambda conn: run_recent(conn, tags, chat_ids, hours, since, until, limit, cursor)
         )
+
+    @server.tool(name="status", annotations=READ_ONLY)
+    def status_tool(chat_ids: list[Int] | None = None) -> dict[str, Any]:
+        """How current the archive is, to tell "not fetched yet" from "nothing found":
+        `sync_running`, the `schedule` (next run estimated), the last run and the last `ok`
+        one (a whole sync or a one-chat resweep), windows waiting for a new embedding
+        (meaning-based search has none or an outdated one for them), and per chat
+        `last_sync_at` (its last sync turn, complete, cut short or failed),
+        `history_complete` (fetched back to its lookback), `oldest_message_at`,
+        `newest_message_at`, `windows_need_rebuild` (a window rebuild is pending: `recent`
+        and meaning-based results may be incomplete or outdated; keyword search finds the
+        stored messages) and `windows_waiting_for_embedding`. Dates UTC."""
+
+        def answer(conn: Conn) -> dict[str, Any]:
+            if chat_ids:
+                _check_chats(conn, chat_ids)
+            return status.status(conn, chat_ids or None, default_years=default_years,
+                                 sync_every_minutes=sync_every_minutes)  # fmt: skip
+
+        return connected(answer)
 
     @server.tool(name="get_thread", annotations=READ_ONLY)
     def get_thread_tool(chat_id: Int, message_id: Int, limit: Int = 50) -> list[dict[str, Any]]:

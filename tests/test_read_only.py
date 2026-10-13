@@ -35,7 +35,7 @@ from tgi.td_fake import FakeTdClient
 from tgi.td_port import FloodWait, TdError
 
 Conn = psycopg.Connection[tuple[object, ...]]
-READS = {"list_chats", "list_tags", "search", "recent", "get_thread", "get_context"}
+READS = {"list_chats", "list_tags", "search", "recent", "status", "get_thread", "get_context"}
 WRITES = {"suggest_tags", "add_chat"}
 ACCOUNT = "+34600000001"
 

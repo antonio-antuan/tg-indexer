@@ -86,6 +86,29 @@ first, each with only its messages inside the range.
 - `limit`: at most 50 (default 20). `get_context`: `before + after` ≤ 100.
   `get_thread`: `limit` ≤ 50.
 
+## Freshness
+
+The archive is filled by a scheduled sync, not live. When an answer depends on it being
+current, or a search finds little, call `status` (optionally with `chat_ids`):
+
+- Per chat, `last_sync_at` is when that chat's last sync turn ended, completed, cut short
+  or failed: an attempt, not proof it is current. `newest_message_at` is its latest stored
+  message. Judge a chat's freshness from these two, not from the runs alone.
+- `last_run` and `last_ok_run` say whether syncing works at all (`error` or
+  `flood_limited` runs in a row are worth mentioning); a run that ended `ok` may have been a
+  one-chat resweep. `schedule.next_run_at` (an estimate) says when new messages may arrive.
+- `history_complete: false`: older history is still being fetched, so the absence of older
+  messages is not evidence.
+- `windows_need_rebuild: true`: a window rebuild is pending for that chat (new, edited or
+  deleted messages): `recent` and meaning-based results may be incomplete or outdated until
+  the next sync; `mode="keyword"` finds the stored messages.
+- `windows_waiting_for_embedding` > 0: those conversations have no, or an outdated,
+  embedding, so meaning-based search may miss them; keyword search sees them. Retry with
+  `mode="keyword"` for recent topics.
+- `sync_running: true`: results may change in a few minutes.
+
+"Nothing found" and "not fetched yet" are different answers; say which.
+
 ## Reading results
 
 - Hits are conversation windows, best first. Hybrid search has no relevance cut-off: the

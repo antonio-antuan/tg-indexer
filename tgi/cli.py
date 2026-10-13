@@ -13,7 +13,7 @@ import typer
 from typer._click.exceptions import UsageError  # typer vendors click; no public alias
 from typer.core import TyperGroup
 
-from tgi import __version__, chats, db, embed, ingest, search, selftest, td
+from tgi import __version__, chats, db, embed, ingest, search, selftest, status, td
 from tgi import mcp as mcp_server
 from tgi.cli_td import td_app
 from tgi.config import Settings, check_years, env_file_warning
@@ -599,6 +599,47 @@ def recent_command(
             typer.echo(f"    {m.link or '(no link)'}")
     if answer.next_cursor is not None:
         typer.echo(f"more: tgi recent --cursor {answer.next_cursor}")
+
+
+@app.command("status")
+def status_command(
+    chat: list[int] | None = _CHATS,
+    as_json: bool = typer.Option(False, "--json", help="Print the answer as JSON."),
+) -> None:
+    """How current the archive is: runs, embedding backlog, per chat history and last sync."""
+    settings = _settings()
+    with db.connect(_database_url()) as conn:
+        answer = status.status(conn, chat or None, default_years=settings.backfill_years,
+                               sync_every_minutes=settings.sync_every_minutes)  # fmt: skip
+    if as_json:
+        typer.echo(json.dumps(answer, ensure_ascii=False, indent=2))
+        return
+    last, ok = answer["last_run"], answer["last_ok_run"]
+    typer.echo("sync running now" if answer["sync_running"] else "no sync running")
+    if (upcoming := answer["schedule"]["next_run_at"]) is not None:
+        typer.echo(f"next scheduled run (estimate): {upcoming}")
+    if last is None:
+        typer.echo("last run: none yet")
+    else:
+        typer.echo(f"last run: {last['status']}, finished {last['finished_at'] or '-'}")
+        typer.echo(f"  {' '.join(f'{k}={v}' for k, v in last['stats'].items())}")
+    if ok is not None and ok != last:
+        typer.echo(f"last ok run: finished {ok['finished_at']}")
+    w = answer["windows"]
+    typer.echo(f"windows: {w['total']}, waiting for embedding: {w['waiting_for_embedding']}")
+    typer.echo("chats (* = enabled):")
+    for c in answer["chats"]:
+        history = "complete" if c["history_complete"] else "incomplete"
+        rebuild = ", messages wait for the window step" if c["windows_need_rebuild"] else ""
+        typer.echo(f"{'*' if c['enabled'] else ' '} {c['chat_id']}  {c['title']}")
+        typer.echo(
+            f"    history {history} ({c['backfill_years']}y, oldest"
+            f" {c['oldest_message_at'] or '-'}), newest {c['newest_message_at'] or '-'}"
+        )
+        typer.echo(
+            f"    last sync turn {c['last_sync_at'] or 'never'}, waiting for embedding"
+            f" {c['windows_waiting_for_embedding']}{rebuild}"
+        )
 
 
 _REFERENCE = typer.Option(
