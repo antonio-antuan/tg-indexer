@@ -163,6 +163,8 @@ def test_chats_add_joins_and_enables_a_public_group(conn: Conn, scenario: Path) 
     assert result.exit_code == 0, result.output
     assert f"enabled {NEW} (supergroup, 2 years)" in result.output
     assert enabled_chats(conn) == {NEW: ("supergroup", True, ACCOUNT, 2)}
+    again = chats_add(scenario, "@valencia_new", "--years", "1")
+    assert again.exit_code == 0 and "(supergroup, 1 year)" in again.output
 
 
 @pytest.mark.parametrize(

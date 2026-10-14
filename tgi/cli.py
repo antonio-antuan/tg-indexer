@@ -403,7 +403,8 @@ def chats_add(
     chat = joined.chat
     more = ", backfill continues on the next sync" if joined.depth.reopens else ""
     typer.echo(
-        f"enabled {chat.chat_id} ({chat.kind}, {joined.depth.years} years{more}): {chat.title}"
+        f"enabled {chat.chat_id} ({chat.kind}, {joined.depth.years}"
+        f" year{'' if joined.depth.years == 1 else 's'}{more}): {chat.title}"
     )
 
 
