@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 from tgi import ingest
 from tgi.cli import app
 from tgi.td_fake import FakeTdClient
+from tgi.td_port import TdError
 
 Conn = psycopg.Connection[tuple[object, ...]]
 ACCOUNT = "+34600000001"
@@ -193,6 +194,49 @@ def test_a_failing_close_records_the_run_as_error(conn: Conn) -> None:
         ingest.sync(conn, lambda _: td, SETTINGS, FakeClock(), close_clients=close)
     row = conn.execute("SELECT status, stats->>'upserted' FROM sync_run").fetchone()
     assert row == ("error", "5")
+
+
+def test_a_failing_close_does_not_hide_the_run_s_own_error(conn: Conn) -> None:
+    td = FakeTdClient({"chats": [chat(A, messages(1, 5, timedelta(hours=1)))],
+                       "faults": [{"call": 1, "error": "boom"}], "runs": []})  # fmt: skip
+    enable(conn, td, A)
+    closed: list[bool] = []
+
+    def close() -> None:
+        closed.append(True)
+        raise TdError(408, "TDLib did not close")
+
+    with pytest.raises(Exception, match="boom"):
+        ingest.sync(conn, lambda _: td, SETTINGS, FakeClock(), close_clients=close)
+    assert closed == [True]
+    row = conn.execute("SELECT status, error FROM sync_run").fetchone()
+    assert row is not None and row[0] == "error" and "408" not in str(row[1])
+
+
+def test_cli_sync_ends_with_an_error_when_tdlib_does_not_close(
+    db_url: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`tgi sync` closes TDLib strictly (codex review): a session that did not close is
+    the run's error, not a warning before the lock is released."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("EMBED_PROVIDER", "fake")
+    path = tmp_path / "scenario.json"
+    path.write_text(json.dumps({"chats": [], "runs": []}))
+
+    def stuck(self: FakeTdClient) -> None:
+        raise TdError(408, "TDLib did not close")
+
+    def sync(_: Any, clients: Any, __: Any, *, close_clients: Any, **___: Any) -> None:
+        clients("+34600000001")
+        close_clients()
+
+    monkeypatch.setattr(FakeTdClient, "close", stuck)
+    monkeypatch.setattr(ingest, "sync", sync)
+    result = CliRunner().invoke(app, ["sync", "--scenario", str(path)])
+    assert result.exit_code == 3, result.output
+    assert "closing a TDLib client failed: TdError 408" in result.output
+    assert "sync failed: TdError 408" in result.output
 
 
 @pytest.mark.parametrize(

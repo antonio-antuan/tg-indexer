@@ -95,7 +95,9 @@ the lock, so a command waiting for the lock never meets a session that is still 
 
 `deploy/tgi-sync.service` and `deploy/tgi-sync.timer` are systemd user unit templates (the
 install commands are in the service's header): `tgi sync` every 3 hours, with the budget from
-`SYNC_MAX_MINUTES` (150), catching up a missed run at the next start. Exit 2 (the lock was held) counts as a skipped run,
+`SYNC_MAX_MINUTES` (150), catching up a missed run at the next start. Set
+`SYNC_EVERY_MINUTES=180` in the `.env` as well: the timer can't tell `tgi`, and `tgi status` and
+`add_chat` read it for the next run time (without it they report no schedule). Exit 2 (the lock was held) counts as a skipped run,
 not a failure. Like the MCP unit they read `~/.config/tgi/.env`, where systemd expands neither
 `${…}` nor `~`: write `DATABASE_URL` with the password itself and absolute paths. For fresher
 answers run it more often with a smaller budget (the timer's header has an hourly example): set

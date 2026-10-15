@@ -5,6 +5,8 @@
 #   install -Dm644 deploy/tgi-sync.service ~/.config/systemd/user/tgi-sync.service
 #   install -Dm644 deploy/tgi-sync.timer ~/.config/systemd/user/tgi-sync.timer
 #   systemctl --user daemon-reload && systemctl --user enable --now tgi-sync.timer
+# and set SYNC_EVERY_MINUTES=180 in that .env (60 for an hourly timer): `tgi status` and
+# add_chat read it to tell when the next run is; restart `tgi mcp` to pick it up.
 # Exit 2 (another sync, embed, purge or forget holds the lock) is a skipped run, not a failure.
 
 [Unit]

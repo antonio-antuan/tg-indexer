@@ -123,14 +123,20 @@ class _Clients:
                     raise typer.BadParameter(str(exc)) from None
         return self._open[account_phone]
 
-    def close(self) -> None:
-        """Close every client; a failure is reported by type and code only."""
+    def close(self, strict: bool = False) -> None:
+        """Close every client; a failure is reported by type and code only. With `strict`
+        the first failure is raised once all are closed: `tgi sync` closes TDLib under the
+        lock and must not release it as if a session that did not close had."""
+        failed: Exception | None = None
         for client in self._open.values():
             try:
                 client.close()
             except Exception as exc:
                 typer.echo(f"closing a TDLib client failed: {ingest.describe_error(exc)}", err=True)
+                failed = failed or exc
         self._open.clear()
+        if strict and failed is not None:
+            raise failed
 
 
 @contextmanager
@@ -186,7 +192,7 @@ def sync_command(
                 result = ingest.sync(
                     conn, clients, settings, resweep=resweep,
                     max_minutes=settings.sync_max_minutes if max_minutes is None else max_minutes,
-                    embedder=embedder, close_clients=clients.close,
+                    embedder=embedder, close_clients=lambda: clients.close(strict=True),
                 )  # fmt: skip
             except ingest.SyncLocked as exc:
                 typer.echo(str(exc), err=True)
@@ -399,6 +405,9 @@ def chats_add(
             raise refuse("the link sent a join request; run this again once approved") from None
         except FloodWait as exc:
             raise refuse(f"Telegram asks to wait {exc.retry_after}s", 3) from None
+        except mcp_server.SessionNotClosed as exc:
+            raise refuse(f"enabled {exc.chat.chat_id}, but TDLib did not close the session"
+                         f" ({ingest.describe_error(exc.error)})", 3) from None  # fmt: skip
         except TdError as exc:
             if mcp_server.not_found(exc):
                 raise refuse("no chat this account can join behind the link") from None
