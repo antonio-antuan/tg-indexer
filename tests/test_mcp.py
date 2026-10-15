@@ -26,7 +26,7 @@ from tgi import chats, ingest, mcp, td
 from tgi.cli import app
 from tgi.embed import FakeEmbedder
 from tgi.td_fake import FakeTdClient
-from tgi.td_port import Chat
+from tgi.td_port import Chat, TdError
 
 Conn = psycopg.Connection[tuple[object, ...]]
 SHIFT = 20
@@ -592,6 +592,29 @@ def test_add_chat_refuses_private_chats_basic_groups_and_pending_joins(
     assert "private" in results[0]["error"]["message"]
     assert "basic_group" in results[1]["error"]["message"]
     assert enabled_chats(conn) == {} and joiner.joined == []
+
+
+def test_add_chat_reports_a_session_that_did_not_close(
+    conn: Conn, db_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex review: after a join, a TDLib session that did not close is an error (the
+    chat is enabled); a failed join keeps its own error even if the close fails too."""
+    closes: list[FakeTdClient] = []
+
+    def stuck(self: FakeTdClient) -> None:
+        closes.append(self)
+        raise TdError(408, "TDLib did not close")
+
+    monkeypatch.setattr(FakeTdClient, "close", stuck)
+    added, refused = with_telegram(db_url, Joiner(), [
+        ("add_chat", {"link": "@valencia_new"}),
+        ("add_chat", {"link": "@some_person"}),
+    ])  # fmt: skip
+    assert added["error"]["code"] == "telegram_error"
+    assert f"chat {NEW} was added" in added["error"]["message"]
+    assert enabled_chats(conn) == {NEW: ("supergroup", True, "+34600000001", None)}
+    assert refused["error"]["code"] == "not_allowed"
+    assert len(closes) == 2
 
 
 def test_add_chat_refuses_out_of_range_years_before_joining(conn: Conn, db_url: str) -> None:

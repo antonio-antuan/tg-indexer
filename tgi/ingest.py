@@ -8,7 +8,7 @@ Logs carry chat and message ids only, never text or account phones (SPEC §5.1, 
 import logging
 import time
 from collections.abc import Callable, Collection, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
@@ -577,7 +577,8 @@ def sync(
     `close_clients` is called once the TDLib steps are over, still under the lock, so a
     command that waits for the lock (`add_chat`, `tgi chats …`) never meets a TDLib session
     that is still closing. If it raises, the run is recorded `error` with the stats so far,
-    the window and embed steps are skipped, and its exception propagates.
+    the window and embed steps are skipped, and its exception propagates. If the TDLib steps
+    failed already, it is still called, but their error is the one recorded and raised.
 
     Raises `SyncLocked` if another run holds the lock. Errors other than flood limits and
     the time budget mark the run `error` and propagate.
@@ -611,9 +612,13 @@ def sync(
                     run.resweep(*resweep)
             except _Stop as stop:
                 status = stop.status
-            finally:
+            except BaseException:
                 if close_clients is not None:
-                    close_clients()  # TDLib is done; the window and embed steps do not need it
+                    with suppress(Exception):  # the run's own error is the one to record
+                        close_clients()
+                raise
+            if close_clients is not None:
+                close_clients()  # TDLib is done; the window and embed steps do not need it
             # Window step (§5.3 step 5): local work, so partial runs do it too.
             for key, n in windows.rebuild_dirty(conn, settings).items():
                 run.stats[key] += n

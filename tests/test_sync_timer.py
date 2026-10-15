@@ -36,6 +36,13 @@ def test_the_service_runs_one_budgeted_sync_and_a_held_lock_is_no_failure() -> N
     assert timer["Install"]["WantedBy"] == "timers.target"
 
 
+def test_the_install_steps_tell_tgi_the_timer_s_schedule() -> None:
+    """The timer cannot export its cadence; without SYNC_EVERY_MINUTES `tgi status` and
+    add_chat report no schedule, so the install steps say to set it."""
+    assert "SYNC_EVERY_MINUTES=180" in SERVICE.read_text()
+    assert "SYNC_EVERY_MINUTES=180" in (ROOT / "README.md").read_text()
+
+
 def test_the_units_hold_no_secrets_and_are_not_writable_by_others() -> None:
     for path in (SERVICE, TIMER):
         text = path.read_text()

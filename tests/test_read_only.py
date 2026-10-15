@@ -197,6 +197,21 @@ def test_chats_add_bad_arguments_exit_1_before_tdlib(
     assert enabled_chats(conn) == {}
 
 
+def test_chats_add_reports_a_session_that_did_not_close(
+    conn: Conn, scenario: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def stuck(self: FakeTdClient) -> None:
+        raise TdError(408, "TDLib did not close")
+
+    monkeypatch.setattr(FakeTdClient, "close", stuck)
+    result = chats_add(scenario, "@valencia_new")
+    assert result.exit_code == 3, result.output
+    assert f"enabled {NEW}, but TDLib did not close the session (TdError 408)" in result.output
+    assert enabled_chats(conn) == {NEW: ("supergroup", True, ACCOUNT, None)}  # the default depth
+    refused = chats_add(scenario, "@some_person")  # a failed join keeps its own error
+    assert refused.exit_code == 1 and "not a private chat" in refused.output
+
+
 def test_chats_add_waits_for_a_running_sync(conn: Conn, scenario: Path, db_url: str) -> None:
     with psycopg.connect(db_url) as other, ingest.sync_lock(other):
         result = chats_add(scenario, "@valencia_new")

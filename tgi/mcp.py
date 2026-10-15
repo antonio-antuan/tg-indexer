@@ -413,6 +413,14 @@ def _sample(client: TdClient, chat_id: int) -> list[Message] | None:
     return sample
 
 
+class SessionNotClosed(Exception):
+    """The chat was joined and enabled, but its TDLib session did not confirm closing."""
+
+    def __init__(self, chat: Chat, error: TdError) -> None:
+        super().__init__(f"chat {chat.chat_id} added; TDLib error {error.code} on close")
+        self.chat, self.error = chat, error
+
+
 @dataclass(frozen=True)
 class Joined:
     """A chat `join_chat` joined and enabled, the account that joined it, the backfill depth
@@ -434,7 +442,11 @@ def join_chat(
     `chats.enable`). Runs under the sync lock, since a running `tgi sync` holds the
     account's TDLib session. Shared by the MCP `add_chat` tool and `tgi chats add`; raises
     `ingest.SyncLocked`, `td.SetupError`, `NotJoinable`, `chats.ChatConflict`,
-    `JoinPending`, `FloodWait` or `TdError`, and the caller words them."""
+    `JoinPending`, `FloodWait`, `TdError` or `SessionNotClosed`, and the caller words them.
+
+    TDLib is closed before the lock is released. A failed join reports its own error even
+    if closing fails too; after a successful one (the chat is then enabled) a failed close
+    is `SessionNotClosed`, so the lock is not released as if the session had closed."""
     with ingest.sync_lock(conn):
         account, client = telegram()
         try:
@@ -444,10 +456,15 @@ def join_chat(
                 lambda chat_id: chats.check_account(conn, chat_id, account),
             )
             sample = _sample(client, chat.chat_id)
-        finally:
-            with contextlib.suppress(TdError):
+            depth = chats.enable(conn, chat, account, years, default_years=default_years)
+        except BaseException:
+            with contextlib.suppress(TdError):  # the join's own error is the one to report
                 client.close()
-        depth = chats.enable(conn, chat, account, years, default_years=default_years)
+            raise
+        try:
+            client.close()
+        except TdError as exc:
+            raise SessionNotClosed(chat, exc) from exc
     return Joined(chat, account, depth, sample)
 
 
@@ -493,6 +510,13 @@ def add_chat(
         _fail("join_pending", "the link sends a join request; add it again once it is approved")
     except FloodWait as exc:
         _fail("flood_wait", f"Telegram asks to wait {exc.retry_after}s")
+    except SessionNotClosed as exc:
+        added = exc.chat.chat_id
+        _fail(
+            "telegram_error",
+            f"chat {added} was added, but TDLib did not close the session"
+            f" (error {exc.error.code}); the next sync may fail until it does",
+        )
     except TdError as exc:
         if not_found(exc):
             _fail("not_found", "no chat this account can join behind the link")
