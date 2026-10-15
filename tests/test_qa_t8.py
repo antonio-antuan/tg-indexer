@@ -61,12 +61,13 @@ def test_one_bad_window_fails_only_its_batch_and_run_stays_ok(
 ) -> None:
     td = mk(conn, 200)
     caplog.set_level("DEBUG")
-    # message 70 → window 70 sits in batch 2 (65..128); text must not leak
+    # newest first: batches 200..137, 136..73, 72..9, 8..1; message 70 → window 70 is in the
+    # third; text must not leak
     conn.execute("SELECT 1")
     emb = FakeEmbedder(fail=lambda t: "message 70" in t.split("\n")[1] + "\n")
     r = sync(conn, td, emb)
     assert r.status == "ok" and r.stats["embed_failed"] == 64 and r.stats["embedded"] == 136
-    assert stale(conn) == list(range(65, 129))
+    assert stale(conn) == list(range(9, 73))
     assert "message 70" not in caplog.text
     td.next_run()
     r2 = sync(conn, td, FakeEmbedder())
@@ -221,7 +222,8 @@ def test_reindex_with_failing_batch_leaves_that_batch_stale(conn: Conn) -> None:
     td = mk(conn, 130)
     sync(conn, td, FakeEmbedder())
     res = embed.reindex(conn, FakeEmbedder(fail=lambda t: "message 100" in t))
-    assert res["embed_failed"] == 64 and stale(conn) == list(range(65, 129))
+    # newest first: window 100 is in the first batch, 130..67
+    assert res["embed_failed"] == 64 and stale(conn) == list(range(67, 131))
     assert count(conn, "window_embedding") == 130 - 64
 
 

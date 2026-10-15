@@ -57,6 +57,20 @@ def check_years(years: int, name: str = "years") -> int:
 MAX_SYNC_EVERY_MINUTES = 7 * 24 * 60
 
 
+_TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
+
+
+def _bool(env: Mapping[str, str], key: str) -> bool:
+    """A yes/no setting, unset or empty meaning no. Anything unrecognised is an error rather
+    than a guess: these settings switch safety features on."""
+    raw = env.get(key, "").strip().lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE or not raw:
+        return False
+    raise ValueError(f"{key} must be one of {', '.join(_TRUE + _FALSE)}")
+
+
 def _str(env: Mapping[str, str], key: str) -> str | None:
     return env.get(key, "").strip() or None
 
@@ -64,6 +78,12 @@ def _str(env: Mapping[str, str], key: str) -> str | None:
 def _sync_every(minutes: int) -> int:
     if minutes > MAX_SYNC_EVERY_MINUTES:
         raise ValueError(f"SYNC_EVERY_MINUTES must be at most {MAX_SYNC_EVERY_MINUTES}")
+    return minutes
+
+
+def _sync_max(minutes: int) -> int:
+    if not 1 <= minutes <= MAX_SYNC_EVERY_MINUTES:
+        raise ValueError(f"SYNC_MAX_MINUTES must be between 1 and {MAX_SYNC_EVERY_MINUTES}")
     return minutes
 
 
@@ -82,7 +102,7 @@ class Settings:
     window_gap_min: int = 30
     window_max_chars: int = 1500
     window_max_msgs: int = 40
-    embed_provider: str = "voyage"  # SPEC §3; tests use "fake"
+    embed_provider: str = "openai"  # SPEC §3 (v1.12; voyage before); tests use "fake"
     embed_model: str | None = None
     voyage_api_key: str | None = field(default=None, repr=False)
     openai_api_key: str | None = field(default=None, repr=False)
@@ -90,7 +110,11 @@ class Settings:
     mcp_token: str | None = field(default=None, repr=False)
     mcp_allowed_hosts: tuple[str, ...] = ()
     mcp_account: str | None = None  # the account `add_chat` joins with; None: the only one
+    mcp_read_only: bool = False  # MCP_READ_ONLY: serve only the tools that read
     sync_every_minutes: int = 0  # the host's sync schedule, for `add_chat` estimates; 0: none
+    # `tgi sync`'s budget without --max-minutes (ingest.DEFAULT_MAX_MINUTES), and the run
+    # length `add_chat` estimates with
+    sync_max_minutes: int = 150
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -115,7 +139,7 @@ class Settings:
             window_gap_min=_int(env, "WINDOW_GAP_MIN", 30),
             window_max_chars=_int(env, "WINDOW_MAX_CHARS", 1500),
             window_max_msgs=_int(env, "WINDOW_MAX_MSGS", 40),
-            embed_provider=_str(env, "EMBED_PROVIDER") or "voyage",
+            embed_provider=_str(env, "EMBED_PROVIDER") or "openai",
             embed_model=_str(env, "EMBED_MODEL"),
             voyage_api_key=_str(env, "VOYAGE_API_KEY"),
             openai_api_key=_str(env, "OPENAI_API_KEY"),
@@ -125,5 +149,7 @@ class Settings:
                 h.strip() for h in env.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
             ),
             mcp_account=_str(env, "MCP_ACCOUNT"),
+            mcp_read_only=_bool(env, "MCP_READ_ONLY"),
             sync_every_minutes=_sync_every(_int(env, "SYNC_EVERY_MINUTES", 0)),
+            sync_max_minutes=_sync_max(_int(env, "SYNC_MAX_MINUTES", 150)),
         )

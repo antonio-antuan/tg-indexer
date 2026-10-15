@@ -105,15 +105,16 @@ def test_failed_batch_stays_stale_run_is_ok_and_next_run_embeds_it(
     conn: Conn, caplog: pytest.LogCaptureFixture
 ) -> None:
     msgs = hourly(150, "SECRET {i}")
-    msgs[99]["text"] = "SECRET boom"  # message 100: window 100, in the second batch (65-128)
+    # newest first: batches 150-87, 86-23, 22-1; message 50 is in the second (86-23)
+    msgs[49]["text"] = "SECRET boom"
     td = FakeTdClient({"chats": [chat(A, msgs)], "runs": [{}]})
     enable(conn, td, A)
     caplog.set_level("DEBUG")
     result = sync(conn, td, FakeEmbedder(fail=lambda t: "boom" in t))
     assert (result.status, result.stats["embedded"], result.stats["embed_failed"]) == (
         "ok", 86, 64)  # fmt: skip
-    assert stale(conn) == list(range(65, 129))
-    assert sorted(embeddings(conn)) == list(range(1, 65)) + list(range(129, 151))
+    assert stale(conn) == list(range(23, 87))
+    assert sorted(embeddings(conn)) == list(range(1, 23)) + list(range(87, 151))
     assert "SECRET" not in caplog.text and "boom" not in caplog.text
     assert any("embed batch" in r.getMessage() and "RuntimeError" in r.getMessage()
                for r in caplog.records)  # fmt: skip
@@ -172,7 +173,7 @@ def test_embed_step_stops_at_the_time_budget(conn: Conn) -> None:
     calls = iter([False, True])
     counts = embed.embed_stale(conn, FakeEmbedder(), lambda: next(calls))
     assert counts == {"embedded": 64, "embed_failed": 0, "embed_stopped": 1}
-    assert stale(conn) == list(range(65, 151))
+    assert stale(conn) == list(range(1, 87))  # the newest 64 (150-87) are embedded
 
 
 # --- tgi embed -----------------------------------------------------------------------------
@@ -218,3 +219,30 @@ def test_reindex_with_an_unusable_dim_deletes_nothing(conn: Conn) -> None:
         embed.reindex(conn, FakeEmbedder(model="fake-512", dim=512))
     assert embeddings(conn) == before and len(before) == 5
     assert stale(conn) == [3]
+
+
+def test_embedding_goes_by_date_not_window_id_and_ties_cross_batches(conn: Conn) -> None:
+    """Newest first means by `end_date`: shuffle the dates against the ids, and give a run of
+    windows one date that spans the 64-window batch boundary."""
+    td = FakeTdClient({"chats": [chat(A, hourly(100))], "runs": [{}]})
+    enable(conn, td, A)
+    sync(conn, td)
+    ids = sorted(embeddings(conn))
+    conn.execute("DELETE FROM window_embedding")
+    conn.execute('UPDATE "window" SET stale = true')
+    # windows 1-30 become the newest (in reverse id order), 31-100 all share one older date
+    for rank, window_id in enumerate(ids[:30]):
+        conn.execute('UPDATE "window" SET end_date = %s WHERE window_id = %s',
+                     (NOW + timedelta(days=1, minutes=rank), window_id))  # fmt: skip
+    conn.execute('UPDATE "window" SET end_date = %s WHERE window_id > %s', (NOW, ids[29]))
+    order: list[int] = []
+
+    class Recording(FakeEmbedder):
+        def embed_documents(self, texts: Any) -> list[list[float]]:
+            order.extend(int(t.split("message ")[1].split()[0]) for t in texts)
+            return super().embed_documents(texts)
+
+    counts = embed.embed_stale(conn, Recording())
+    assert counts["embedded"] == 100 and stale(conn) == []
+    # 30, 29, …, 1 by date, then the tie broken by id descending: 100, 99, …, 31
+    assert order == list(range(30, 0, -1)) + list(range(100, 30, -1))

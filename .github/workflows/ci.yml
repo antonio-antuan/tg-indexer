@@ -31,6 +31,8 @@ jobs:
           --health-retries 30
     env:
       DATABASE_URL: postgresql://tgi:ci-ephemeral@127.0.0.1:5432/tgi
+      # Typer styles its errors whenever GITHUB_ACTIONS is set; the tests read them as plain text.
+      _TYPER_FORCE_DISABLE_TERMINAL: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

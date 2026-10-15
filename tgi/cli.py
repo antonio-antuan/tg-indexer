@@ -10,15 +10,16 @@ from pathlib import Path
 from typing import Any, cast
 
 import typer
+from mcp.server.mcpserver.exceptions import ToolError
 from typer._click.exceptions import UsageError  # typer vendors click; no public alias
 from typer.core import TyperGroup
 
-from tgi import __version__, chats, db, embed, ingest, search, selftest, td
+from tgi import __version__, chats, db, embed, ingest, search, selftest, status, td
 from tgi import mcp as mcp_server
 from tgi.cli_td import td_app
 from tgi.config import Settings, check_years, env_file_warning
 from tgi.td_fake import FakeTdClient
-from tgi.td_port import TdClient, TdError
+from tgi.td_port import FloodWait, JoinPending, NotJoinable, TdClient, TdError, parse_link
 
 
 class _Group(TyperGroup):
@@ -142,6 +143,18 @@ def _tdlib_errors(what: str) -> Iterator[None]:
         raise typer.Exit(3) from None
 
 
+@contextmanager
+def _sync_lock_or_exit(conn: Any, what: str) -> Iterator[None]:
+    """Hold the sync lock while a command uses an account's TDLib session, which a running
+    `tgi sync` holds too; exit 2 when it is taken, as `sync` does."""
+    try:
+        with ingest.sync_lock(conn):
+            yield
+    except ingest.SyncLocked:
+        typer.echo(f"{what}: a tgi sync, embed, purge or forget is running; try again", err=True)
+        raise typer.Exit(2) from None
+
+
 # Supergroup ids are negative (-100…); without this click reads them as unknown options.
 _CHAT_ID_ARGS = {"ignore_unknown_options": True}
 
@@ -149,7 +162,9 @@ _CHAT_ID_ARGS = {"ignore_unknown_options": True}
 @app.command("sync", context_settings=_CHAT_ID_ARGS)
 def sync_command(
     chat_id: int | None = typer.Argument(None, help="The chat for --resweep-days."),
-    max_minutes: float = typer.Option(150, "--max-minutes", min=0, help="Run time budget."),
+    max_minutes: float | None = typer.Option(
+        None, "--max-minutes", min=0, help="Run time budget (default: SYNC_MAX_MINUTES, 150)."
+    ),
     resweep_days: int | None = typer.Option(
         None, "--resweep-days", min=1, help="Only re-run CHAT_ID's sweep over N days."
     ),
@@ -169,8 +184,9 @@ def sync_command(
         with db.connect(_database_url()) as conn:
             try:
                 result = ingest.sync(
-                    conn, clients, settings, max_minutes=max_minutes, resweep=resweep,
-                    embedder=embedder,
+                    conn, clients, settings, resweep=resweep,
+                    max_minutes=settings.sync_max_minutes if max_minutes is None else max_minutes,
+                    embedder=embedder, close_clients=clients.close,
                 )  # fmt: skip
             except ingest.SyncLocked as exc:
                 typer.echo(str(exc), err=True)
@@ -288,14 +304,15 @@ _ACCOUNT = typer.Option(..., "--account", help="Account phone, e.g. +34...")
 
 @chats_app.command("list")
 def chats_list(account: str = _ACCOUNT, scenario: Path | None = _SCENARIO) -> None:
-    """Show the account's dialogs; '*' marks enabled chats."""
-    clients = _Clients(scenario)
-    try:
-        with _tdlib_errors("chats list"):
-            dialogs = clients(account).get_chats()
-    finally:
-        clients.close()
+    """Show the account's dialogs; '*' marks enabled chats. Exit 2 while a sync runs."""
     with db.connect(_database_url()) as conn:
+        with _sync_lock_or_exit(conn, "chats list"):
+            clients = _Clients(scenario)
+            try:
+                with _tdlib_errors("chats list"):
+                    dialogs = clients(account).get_chats()
+            finally:
+                clients.close()
         enabled = chats.enabled_ids(conn, account)
     for chat in dialogs:
         mark = "*" if chat.chat_id in enabled else " "
@@ -309,20 +326,21 @@ def chats_enable(
     years: int | None = typer.Option(None, "--years", help="Backfill lookback."),
     scenario: Path | None = _SCENARIO,
 ) -> None:
-    """Add a chat to the allowlist."""
+    """Add a chat to the allowlist. Exit 2 while a sync runs."""
     try:  # before TDLib is opened or anything is written
         if years is not None:
             check_years(years)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--years") from None
     default_years = _settings().backfill_years
-    clients = _Clients(scenario)
-    try:
-        with _tdlib_errors("chats enable"):
-            chat = clients(account).get_chat(chat_id)
-    finally:
-        clients.close()
     with db.connect(_database_url()) as conn:
+        with _sync_lock_or_exit(conn, "chats enable"):
+            clients = _Clients(scenario)
+            try:
+                with _tdlib_errors("chats enable"):
+                    chat = clients(account).get_chat(chat_id)
+            finally:
+                clients.close()
         try:
             depth = chats.enable(conn, chat, account, years, default_years=default_years)
         except chats.ChatConflict as exc:
@@ -330,6 +348,88 @@ def chats_enable(
             raise typer.Exit(1) from None
     more = f", backfill continues to {depth.years} years on the next sync" if depth.reopens else ""
     typer.echo(f"enabled {chat_id}{more}")
+
+
+@chats_app.command("add", context_settings=_CHAT_ID_ARGS)
+def chats_add(
+    link: str,
+    account: str = _ACCOUNT,
+    years: int | None = typer.Option(None, "--years", help="Backfill lookback."),
+    scenario: Path | None = _SCENARIO,
+) -> None:
+    """Join a supergroup or channel from a t.me link and add it to the allowlist.
+
+    LINK is https://t.me/name, an invite link https://t.me/+..., @name, or a chat id. The
+    same join as the MCP add_chat tool; it waits for no sync (exit 2 while one runs)."""
+    try:  # before TDLib is opened or anything is written
+        parsed = parse_link(link)
+    except ValueError:
+        raise typer.BadParameter(
+            "must be a t.me link, an @username or a chat id", param_hint="LINK"
+        ) from None
+    try:
+        if years is not None:
+            check_years(years)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--years") from None
+    settings = _settings()
+
+    def telegram() -> tuple[str, TdClient]:
+        if scenario is not None:
+            return account, FakeTdClient.from_file(scenario)
+        return account, td.open_client(settings, account)
+
+    def refuse(message: str, code: int = 1) -> typer.Exit:
+        typer.echo(message, err=True)
+        return typer.Exit(code)
+
+    with db.connect(_database_url()) as conn:
+        try:
+            joined = mcp_server.join_chat(conn, telegram, parsed, years, settings.backfill_years)
+        except ingest.SyncLocked:
+            raise refuse("a tgi sync, embed, purge or forget is running; try again", 2) from None
+        except td.SetupError as exc:
+            raise typer.BadParameter(str(exc)) from None
+        except NotJoinable as exc:
+            kind = exc.kind
+            raise refuse(f"only supergroups and channels can be added, not a {kind} chat") from None
+        except chats.ChatConflict as exc:
+            raise refuse(str(exc)) from None
+        except JoinPending:
+            raise refuse("the link sent a join request; run this again once approved") from None
+        except FloodWait as exc:
+            raise refuse(f"Telegram asks to wait {exc.retry_after}s", 3) from None
+        except TdError as exc:
+            if mcp_server.not_found(exc):
+                raise refuse("no chat this account can join behind the link") from None
+            raise refuse(f"chats add failed: {ingest.describe_error(exc)}", 3) from None
+    chat = joined.chat
+    more = ", backfill continues on the next sync" if joined.depth.reopens else ""
+    typer.echo(
+        f"enabled {chat.chat_id} ({chat.kind}, {joined.depth.years}"
+        f" year{'' if joined.depth.years == 1 else 's'}{more}): {chat.title}"
+    )
+
+
+@chats_app.command("archived")
+def chats_archived(
+    tag: str | None = typer.Option(None, "--tag", help="Only chats this tag is confirmed for."),
+    as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
+) -> None:
+    """The chats in the archive with confirmed tags, message counts and date range (the MCP
+    list_chats); `tgi chats list` shows the account's Telegram dialogs instead."""
+    with db.connect(_database_url()) as conn, _tool_errors():
+        rows = mcp_server.list_chats(conn, tag)
+    if as_json:
+        typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+    for c in rows:
+        tags = ",".join(c["tags"]) or "-"
+        dates = f"{c['first_date'] or '-'} .. {c['last_date'] or '-'}"
+        typer.echo(
+            f"{c['chat_id']}\t{c['kind']}\t{c['title']}\ttags {tags}\t"
+            f"{c['message_count']} messages, {dates}"
+        )
 
 
 @chats_app.command("disable", context_settings=_CHAT_ID_ARGS)
@@ -372,6 +472,50 @@ def _tag_result(done: bool, missing: str) -> None:
         raise typer.Exit(1)
 
 
+@contextmanager
+def _tool_errors() -> Iterator[None]:
+    """An MCP tool function's error (`unknown_chat`, `bad_range`, …) as exit 1 with its message."""
+    try:
+        yield
+    except ToolError as exc:
+        error = json.loads(str(exc))
+        typer.echo(f"{error['code']}: {error['message']}", err=True)
+        raise typer.Exit(1) from None
+
+
+def _tool_exit(code: str, exc: Exception) -> typer.Exit:
+    """Exit 1 with `code: message`, as `_tool_errors` reports a tool's error."""
+    typer.echo(f"{code}: {exc}", err=True)
+    return typer.Exit(1)
+
+
+def _check_filters(conn: Any, tags: list[str] | None, chat_ids: list[int] | None) -> None:
+    """Unknown tags and chats are errors, as in the MCP tools (`unknown_tag`, exit 1)."""
+    with _tool_errors():
+        if tags:
+            mcp_server._check_tags(conn, tags)
+        if chat_ids:
+            mcp_server._check_chats(conn, chat_ids)
+
+
+def _print_messages(messages: list[dict[str, Any]]) -> None:
+    for m in messages:
+        typer.echo(f"{m['date']} {m['sender_name'] or '?'}: {m['text']}")
+        typer.echo(f"    {m['link'] or '(no link)'}  [message_id {m['message_id']}]")
+
+
+@tags_app.command("list")
+def tags_list(as_json: bool = typer.Option(False, "--json", help="Print as JSON.")) -> None:
+    """Each tag with each status it has and how many chats have it so (the MCP list_tags)."""
+    with db.connect(_database_url()) as conn:
+        tags = mcp_server.list_tags(conn)
+    if as_json:
+        typer.echo(json.dumps(tags, ensure_ascii=False, indent=2))
+        return
+    for t in tags:
+        typer.echo(f"{t['tag']}\t{t['status']}\t{t['chat_count']} chats")
+
+
 @tags_app.command("propose", context_settings=_CHAT_ID_ARGS)
 def tags_propose(
     chat_id: int,
@@ -409,15 +553,6 @@ def tags_remove(chat_id: int, tag: str) -> None:
     typer.echo(f"removed {tag.strip()} from {chat_id}")
 
 
-def _date(value: str | None, name: str) -> date | None:
-    if value is None:
-        return None
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        raise typer.BadParameter(f"{name} must be a date, YYYY-MM-DD") from None
-
-
 _QUERIES = typer.Argument(..., help="One or more queries; hits are fused.")
 _TAGS = typer.Option(None, "--tag", help="Confirmed tag (repeatable).")
 _CHATS = typer.Option(None, "--chat", help="Chat id (repeatable).")
@@ -428,11 +563,16 @@ def search_command(
     queries: list[str] = _QUERIES,
     tag: list[str] | None = _TAGS,
     chat: list[int] | None = _CHATS,
-    since: str | None = typer.Option(None, "--since", help="First day, YYYY-MM-DD (UTC)."),
-    until: str | None = typer.Option(None, "--until", help="Last day, YYYY-MM-DD (UTC)."),
+    since: str | None = typer.Option(
+        None, "--since", help="First day YYYY-MM-DD, or an ISO date-time (UTC)."
+    ),
+    until: str | None = typer.Option(
+        None, "--until", help="Last day YYYY-MM-DD, or an ISO date-time (UTC)."
+    ),
     limit: int = typer.Option(20, "--limit", min=1, max=search.MAX_LIMIT),
     include_deleted: bool = typer.Option(False, "--include-deleted"),
     as_json: bool = typer.Option(False, "--json", help="Print the hits as JSON."),
+    compact: bool = typer.Option(False, "--compact", help="Matched messages and neighbours."),
     mode: str = typer.Option(
         "hybrid", "--mode", help="hybrid, keyword or semantic.", show_default=True
     ),
@@ -442,31 +582,212 @@ def search_command(
         raise typer.BadParameter("--mode must be hybrid, keyword or semantic")
     try:
         with db.connect(_database_url()) as conn:
+            _check_filters(conn, tag, chat)
             hits = search.search(
                 conn,
                 queries,
                 tags=tag or None,
                 chat_ids=chat or None,
-                since=_date(since, "--since"),
-                until=_date(until, "--until"),
+                since=_when(since, "--since"),
+                until=_when(until, "--until"),
                 mode=cast(search.Mode, mode),
                 limit=limit,
                 include_deleted=include_deleted,
+                compact=compact,
             )
     except (search.EmbedderUnavailable, search.ModelMismatch) as exc:
         typer.echo(f"search failed: {exc}", err=True)
         raise typer.Exit(3) from None
-    except ValueError as exc:  # bad range, empty queries
-        raise typer.BadParameter(str(exc)) from None
+    except search.BadRange as exc:
+        raise _tool_exit("bad_range", exc) from None
+    except ValueError as exc:  # empty queries
+        raise _tool_exit("bad_argument", exc) from None
     if as_json:
         typer.echo(json.dumps([h.as_dict() for h in hits], ensure_ascii=False, indent=2))
         return
     for h in hits:
         where = "message" if h.window_id is None else f"window {h.window_id}"
-        typer.echo(f"{h.score:.4f}  {h.chat_title}  {h.start_date:%Y-%m-%d %H:%M}  ({where})")
+        why = ",".join(h.matched_by)
+        typer.echo(
+            f"{h.score:.4f}  {h.chat_title}  {h.start_date:%Y-%m-%d %H:%M}  ({where}; {why})"
+        )
         for m in h.messages:
             typer.echo(f"  {m.date:%Y-%m-%d %H:%M} {m.sender_name or '?'}: {m.text}")
             typer.echo(f"    {m.link or '(no link)'}")
+
+
+def _when(value: str | None, name: str) -> date | None:
+    """A date (a whole UTC day) or an ISO date-time (UTC without a zone)."""
+    if value is None:
+        return None
+    try:
+        return search.parse_when(value)
+    except ValueError:
+        raise typer.BadParameter(f"{name} must be YYYY-MM-DD or an ISO date-time") from None
+
+
+@app.command("recent")
+def recent_command(
+    tag: list[str] | None = _TAGS,
+    chat: list[int] | None = _CHATS,
+    hours: int | None = typer.Option(None, "--hours", help="Back from now (default 24)."),
+    since: str | None = typer.Option(None, "--since", help="YYYY-MM-DD or ISO date-time (UTC)."),
+    until: str | None = typer.Option(
+        None, "--until", help="Exclusive end: YYYY-MM-DD (that whole day) or ISO date-time."
+    ),
+    limit: int = typer.Option(20, "--limit", help="Windows per page, 1 to 50."),
+    cursor: str | None = typer.Option(None, "--cursor", help="next_cursor of a previous page."),
+    as_json: bool = typer.Option(False, "--json", help="Print the answer as JSON."),
+    compact: bool = typer.Option(False, "--compact", help="Cut long message texts."),
+) -> None:
+    """What's new: windows with messages in a time range, newest first, no query (the MCP
+    recent).
+
+    --until is exclusive and defaults to now. --cursor continues a listing: it keeps the
+    range and filters, so the other options but --limit are ignored with it."""
+    with db.connect(_database_url()) as conn, _tool_errors():
+        answer = mcp_server.run_recent(
+            conn,
+            tags=tag,
+            chat_ids=chat,
+            hours=hours,
+            # the cursor carries the range: --since/--until are not even parsed
+            since=None if cursor else _when(since, "--since"),
+            until=None if cursor else _when(until, "--until"),
+            limit=limit,
+            cursor=cursor,
+            compact=compact,
+        )
+    if as_json:
+        typer.echo(json.dumps(answer, ensure_ascii=False, indent=2))
+        return
+    for h in answer["hits"]:
+        typer.echo(f"{h['chat_title']}  {h['start_date']}  (window {h['window_id']})")
+        _print_messages(h["messages"])
+    if answer["next_cursor"] is not None:
+        typer.echo(f"more: tgi recent --cursor {answer['next_cursor']}")
+
+
+@app.command("status")
+def status_command(
+    chat: list[int] | None = _CHATS,
+    as_json: bool = typer.Option(False, "--json", help="Print the answer as JSON."),
+) -> None:
+    """How current the archive is: runs, embedding backlog, per chat history and last sync."""
+    settings = _settings()
+    with db.connect(_database_url()) as conn:
+        _check_filters(conn, None, chat)
+        answer = status.status(conn, chat or None, default_years=settings.backfill_years,
+                               sync_every_minutes=settings.sync_every_minutes)  # fmt: skip
+    if as_json:
+        typer.echo(json.dumps(answer, ensure_ascii=False, indent=2))
+        return
+    last, ok = answer["last_run"], answer["last_ok_run"]
+    held = answer["sync_lock_held"]
+    typer.echo("a sync (or embed, purge, forget, join) is running" if held else "nothing running")
+    if (upcoming := answer["schedule"]["next_run_at"]) is not None:
+        typer.echo(f"next scheduled run (estimate): {upcoming}")
+    if last is None:
+        typer.echo("last run: none yet")
+    else:
+        typer.echo(f"last run: {last['status']}, finished {last['finished_at'] or '-'}")
+        typer.echo(f"  {' '.join(f'{k}={v}' for k, v in last['stats'].items())}")
+    if ok is not None and ok != last:
+        typer.echo(f"last ok run: finished {ok['finished_at']}")
+    w = answer["windows"]
+    typer.echo(f"windows: {w['total']}, waiting for embedding: {w['waiting_for_embedding']}")
+    typer.echo("chats (* = enabled):")
+    for c in answer["chats"]:
+        history = "complete" if c["history_complete"] else "incomplete"
+        rebuild = ", messages wait for the window step" if c["windows_need_rebuild"] else ""
+        typer.echo(f"{'*' if c['enabled'] else ' '} {c['chat_id']}  {c['title']}")
+        typer.echo(
+            f"    history {history} ({c['backfill_years']}y, to {c['history_cutoff'] or '-'};"
+            f" oldest"
+            f" {c['oldest_message_at'] or '-'}), newest {c['newest_message_at'] or '-'}"
+        )
+        typer.echo(
+            f"    last sync attempt {c['last_sync_attempt_at'] or 'never'}, waiting for embedding"
+            f" {c['windows_waiting_for_embedding']}{rebuild}"
+        )
+
+
+# A message link: t.me/<username>/<n> (also t.me/s/<username>/<n>, the web preview) or
+# t.me/c/<chat>/<n>, each with an optional topic id before <n> and an optional "/".
+_LINK = re.compile(
+    r"(?:https?://)?t\.me/(?:c/(?P<internal>\d+)|(?:s/)?(?P<user>[A-Za-z][A-Za-z0-9_]{3,31}))"
+    r"(?:/\d+)?/(?P<id>\d+)/?(?:[?#].*)?"
+)
+Ref = tuple[int, str | None, int | None]  # message_id, a link's username or internal chat id
+
+
+def _message_ref(value: str) -> Ref:
+    """A `message_id` as tools return it, or a t.me message link: its last number is the
+    server id, and TDLib ids of server messages are `server_id << 20`. Which chat a link
+    names is checked against the chat (`_check_link`), not against a list of t.me paths."""
+    text = value.strip()
+    if re.fullmatch(r"-?\d+", text):
+        return int(text), None, None
+    if m := _LINK.fullmatch(text):
+        return int(m["id"]) << 20, m["user"], int(m["internal"]) if m["internal"] else None
+    raise typer.BadParameter("must be a message_id or a t.me message link", param_hint="MESSAGE")
+
+
+def _check_link(conn: Any, chat_id: int, ref: Ref) -> None:
+    """A link must be one of `chat_id`'s: its username, or its id without -100 (/c/ links).
+    t.me's own paths (joinchat, call, …) and another chat's links are `bad_argument`."""
+    _, user, internal = ref
+    if user is None and internal is None:
+        return
+    row = conn.execute("SELECT username FROM chat WHERE chat_id = %s", (chat_id,)).fetchone()
+    if row is None:
+        return  # the tool answers unknown_chat
+    username = cast(str | None, row[0])
+    if user is not None and username is not None and user.lower() == username.lower():
+        return
+    if internal is not None and internal == -chat_id - 10**12:
+        return
+    raise _tool_exit("bad_argument", ValueError("the link is not a message of this chat"))
+
+
+_MESSAGE = typer.Argument(..., help="A message_id, or the message's t.me link.")
+
+
+@app.command("context", context_settings=_CHAT_ID_ARGS)
+def context_command(
+    chat_id: int,
+    message: str = _MESSAGE,
+    before: int = typer.Option(10, "--before", min=0),
+    after: int = typer.Option(10, "--after", min=0),
+    as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
+) -> None:
+    """A message with the messages around it in its chat (the MCP get_context)."""
+    ref = _message_ref(message)
+    with db.connect(_database_url()) as conn, _tool_errors():
+        _check_link(conn, chat_id, ref)
+        messages = mcp_server.get_context(conn, chat_id, ref[0], before, after)
+    if as_json:
+        typer.echo(json.dumps(messages, ensure_ascii=False, indent=2))
+        return
+    _print_messages(messages)
+
+
+@app.command("thread", context_settings=_CHAT_ID_ARGS)
+def thread_command(
+    chat_id: int,
+    message: str = _MESSAGE,
+    limit: int = typer.Option(50, "--limit", min=1, max=search.MAX_LIMIT),
+    as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
+) -> None:
+    """The reply chain up to the root message and the replies to it (the MCP get_thread)."""
+    ref = _message_ref(message)
+    with db.connect(_database_url()) as conn, _tool_errors():
+        _check_link(conn, chat_id, ref)
+        messages = mcp_server.get_thread(conn, chat_id, ref[0], limit)
+    if as_json:
+        typer.echo(json.dumps(messages, ensure_ascii=False, indent=2))
+        return
+    _print_messages(messages)
 
 
 _REFERENCE = typer.Option(
@@ -549,10 +870,15 @@ def mcp_main(
     settings = _settings()
     server = mcp_server.build_server(
         _database_url(),
-        telegram=_mcp_telegram(settings),
+        # read-only: no tool can reach Telegram, so the server never opens the account
+        telegram=None if settings.mcp_read_only else _mcp_telegram(settings),
         default_years=settings.backfill_years,
         sync_every_minutes=settings.sync_every_minutes,
+        sync_max_minutes=settings.sync_max_minutes,
+        read_only=settings.mcp_read_only,
     )
+    if settings.mcp_read_only:
+        typer.echo("tgi mcp: MCP_READ_ONLY: suggest_tags and add_chat are off", err=True)
     if stdio:
         server.run("stdio")
         return

@@ -18,11 +18,16 @@ Windows are fused across legs and queries by reciprocal rank (`k = 60`). Queries
 as given: expansion is the agent's job. Logs carry counts only, never queries or text.
 """
 
+import base64
+import binascii
+import json
 import logging
 import math
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
+from itertools import groupby
 from typing import Any, Literal, cast
 
 from psycopg import sql
@@ -40,10 +45,16 @@ K = 100  # messages per query from the keyword leg, windows from the semantic le
 EF_SEARCH = 200  # hnsw.ef_search for the semantic leg (SPEC §4)
 RRF_K = 60
 MAX_LIMIT = 50  # SPEC §5.6 result bound
+MAX_RECENT_HOURS = 24 * 31  # `recent(hours=…)`: a month; longer is what search is for
 SHORT_TOKEN = 6  # tokens up to this many characters also go to the trigram leg
 TRGM_THRESHOLD = 0.5
 HIGHLIGHT_CHARS = 200
 MAX_HIGHLIGHTS = 3
+# compact hits: the matched messages and this many neighbours each side, or the first few
+# messages when only the semantic leg found the window; texts cut to COMPACT_CHARS
+COMPACT_NEIGHBOURS = 2
+COMPACT_MESSAGES = 5
+COMPACT_CHARS = 400
 CONFIGS = ("russian", "spanish", "english")
 
 
@@ -66,6 +77,7 @@ class HitMessage:
     date: datetime
     text: str
     link: str | None
+    truncated: bool = False  # compact: `text` was cut to COMPACT_CHARS
 
 
 @dataclass(frozen=True)
@@ -81,6 +93,13 @@ class Hit:
     score: float
     messages: list[HitMessage]
     highlights: list[str]
+    # why `search` returned it: the legs (`keyword`, `trigram`, `semantic`), the positions
+    # in `queries` that found it, and its best cosine distance on the semantic leg
+    matched_by: tuple[str, ...] = ()
+    matched_message_ids: tuple[int, ...] = ()  # the messages the keyword legs matched
+    matched_queries: tuple[int, ...] = ()
+    semantic_distance: float | None = None
+    omitted_messages: int = 0  # compact: the window's messages left out (`get_context`)
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-ready: dates as ISO 8601 strings, in UTC."""
@@ -99,11 +118,37 @@ class Hit:
                     "date": m.date.isoformat(),
                     "text": m.text,
                     "link": m.link,
+                    **({"truncated": True} if m.truncated else {}),
                 }
                 for m in self.messages
             ],  # fmt: skip
             "highlights": self.highlights,
+            "matched_by": list(self.matched_by),
+            "matched_message_ids": list(self.matched_message_ids),
+            "matched_queries": list(self.matched_queries),
+            "semantic_distance": self.semantic_distance,
+            "omitted_messages": self.omitted_messages,
         }
+
+
+def compacted(hit: Hit, keep: set[int] | None) -> Hit:
+    """`hit` for a chat assistant: the messages in `keep` and COMPACT_NEIGHBOURS around each
+    (None or none of them present: the first COMPACT_MESSAGES, a sample rather than the
+    relevant part), texts over COMPACT_CHARS cut to at most that many characters plus "…"
+    and marked `truncated`, and `omitted_messages` counting what was left out."""
+    positions = [i for i, m in enumerate(hit.messages) if keep and m.message_id in keep]
+    if positions:
+        wanted = {j for i in positions
+                  for j in range(i - COMPACT_NEIGHBOURS, i + COMPACT_NEIGHBOURS + 1)}  # fmt: skip
+        kept = [m for i, m in enumerate(hit.messages) if i in wanted]
+    else:
+        kept = hit.messages[:COMPACT_MESSAGES]
+    cut = [
+        replace(m, text=m.text[:COMPACT_CHARS].rstrip() + "…", truncated=True)
+        if len(m.text) > COMPACT_CHARS else m
+        for m in kept
+    ]  # fmt: skip
+    return replace(hit, messages=cut, omitted_messages=len(hit.messages) - len(kept))
 
 
 def link(kind: str, chat_id: int, username: str | None, server_message_id: int) -> str | None:
@@ -138,10 +183,13 @@ def _bound(value: date | None, end: bool) -> datetime | None:
     """The filter bound on `message.date`, `>=` for `since` and `<` for `until` (`end`).
 
     A `date` covers its whole UTC day; a `datetime` is inclusive (timestamps are whole
-    microseconds, so the exclusive bound is one microsecond later)."""
+    microseconds, so the exclusive bound is one microsecond later) and UTC when it has no
+    zone, never the session's TimeZone."""
     if value is None:
         return None
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
         return value + timedelta(microseconds=1) if end else value
     day = datetime.combine(value, time(), tzinfo=UTC)
     return day + timedelta(days=1) if end else day
@@ -416,8 +464,12 @@ def search(
     limit: int = 20,
     include_deleted: bool = False,
     embedder: Embedder | None = None,
+    compact: bool = False,
 ) -> list[Hit]:
     """SPEC §5.5 `search`: `limit` windows by reciprocal-rank fusion over legs and queries.
+
+    Each hit says why it was found (`matched_by`, `matched_queries`, `semantic_distance`);
+    with `compact` it is cut down for a chat assistant (`compacted`).
 
     `since`/`until` bound `message.date` inclusively (a `date` covers its whole UTC day),
     and the semantic leg's windows by overlap. Tombstoned messages are left out unless
@@ -427,7 +479,8 @@ def search(
     """
     if mode not in ("hybrid", "keyword", "semantic"):
         raise ValueError("mode must be hybrid, keyword or semantic")
-    queries = [q for q in (q.strip() for q in queries) if q]
+    numbered = [(i, q.strip()) for i, q in enumerate(queries) if q.strip()]  # caller's positions
+    queries = [q for _, q in numbered]
     if not queries:
         raise ValueError("at least one non-empty query is needed")
     if not 1 <= limit <= MAX_LIMIT:
@@ -439,45 +492,263 @@ def search(
     if chats == []:
         return []
 
-    # Each leg of each query is one ranked list of (key, matched message); keyword lists come
-    # first, so on a tie in score the keyword hit seen first wins, as in keyword mode.
-    vectors: list[list[float]] = []
+    # Each leg of each query is one ranked list of (key, matched message, legs, distance),
+    # tagged with the query's position; keyword lists come first, so on a tie in score the
+    # keyword hit seen first wins, as in keyword mode.
+    vectors: list[tuple[int, list[float]]] = []
     if mode != "keyword":
-        positives = [p for p in (positive(q).strip() for q in queries) if p]
+        positives = [(i, p) for i, p in ((i, positive(q).strip()) for i, q in numbered) if p]
         if positives:  # a negation-only query gets no semantic leg and embeds nothing
-            vectors = _query_vectors(conn, positives, embedder)
-    lists: list[list[tuple[Key, tuple[int, int] | None]]] = []
+            embedded = _query_vectors(conn, [p for _, p in positives], embedder)
+            vectors = [(i, v) for (i, _), v in zip(positives, embedded, strict=False)]
+    Entry = tuple[Key, tuple[int, int] | None, tuple[str, ...], float | None]
+    lists: list[tuple[int, list[Entry]]] = []
     if mode != "semantic":
-        for q in queries:
-            lists.append([
+        for i, q in numbered:
+            lists.append((i, [
                 (("w", m.window_id) if m.window_id is not None else ("m", m.chat_id, m.message_id),
-                 (m.chat_id, m.message_id))
+                 (m.chat_id, m.message_id),
+                 ("keyword",) * (m.fts is not None) + ("trigram",) * (m.trgm is not None),
+                 None)
                 for m in keyword_leg(conn, q, chats, lo, hi, include_deleted)
-            ])  # fmt: skip
-    for vec in vectors:
+            ]))  # fmt: skip
+    for i, vec in vectors:
         rows, _ = semantic_leg(conn, vec, chats, lo, hi, limit=limit)
-        lists.append([(("w", window_id), None) for window_id, _ in rows])
+        lists.append((i, [(("w", w), None, ("semantic",), d) for w, d in rows]))
 
     scores: dict[Key, float] = {}
     matched: dict[Key, list[tuple[int, int]]] = {}
-    for ranked_list in lists:
+    legs: dict[Key, set[str]] = {}
+    found_by: dict[Key, set[int]] = {}
+    distance: dict[Key, float] = {}
+    for query_index, ranked_list in lists:
         seen: set[Key] = set()
-        for key, msg in ranked_list:
+        for key, msg, via, dist in ranked_list:
             matched.setdefault(key, [])
             if msg is not None and msg not in matched[key]:
                 matched[key].append(msg)
+            legs.setdefault(key, set()).update(via)
+            found_by.setdefault(key, set()).add(query_index)
+            if dist is not None:
+                distance[key] = min(dist, distance.get(key, dist))
             if key not in seen:  # a window's rank in this list is its best message's
                 seen.add(key)
                 scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + len(seen))
     ranked = sorted(scores, key=lambda k: -scores[k])[:limit]  # stable: first seen wins ties
     tokens = [t for q in queries for t in re.findall(r"\w+", q)]
-    hits = [
-        hit
-        for key in ranked
-        if (hit := _hit(conn, key, scores[key], matched[key], tokens, include_deleted)) is not None
-    ]
+    order = ("keyword", "trigram", "semantic")
+    hits = []
+    for key in ranked:
+        hit = _hit(conn, key, scores[key], matched[key], tokens, include_deleted)
+        if hit is None:
+            continue
+        hit = replace(
+            hit,
+            matched_by=tuple(leg for leg in order if leg in legs[key]),
+            matched_message_ids=tuple(
+                m.message_id for m in hit.messages if (hit.chat_id, m.message_id) in matched[key]
+            ),
+            matched_queries=tuple(sorted(found_by[key])),
+            semantic_distance=distance.get(key),
+        )
+        if compact:
+            hit = compacted(hit, {mid for _, mid in matched[key]})
+        hits.append(hit)
     log.info("search mode=%s queries=%s legs=%s hits=%s", mode, len(queries), len(lists), len(hits))
     return hits
+
+
+@dataclass(frozen=True)
+class Recent:
+    """`recent`'s answer: the range it covered, `since` ≤ message date < `until`, the
+    server's `now`, the hits (their `score` carries no meaning here), and `next_cursor` for
+    the next page (None: no more)."""
+
+    now: datetime
+    since: datetime
+    until: datetime
+    hits: list[Hit]
+    next_cursor: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "now": self.now.astimezone(UTC).isoformat(),
+            "since": self.since.astimezone(UTC).isoformat(),
+            "until": self.until.astimezone(UTC).isoformat(),
+            "hits": [h.as_dict() for h in self.hits],
+            "next_cursor": self.next_cursor,
+        }
+
+
+def parse_when(text: str) -> date:
+    """A bound as a caller writes it: `YYYY-MM-DD` is a date (a whole UTC day), anything
+    longer an ISO date-time (`T` or a space before the time; UTC without a zone).
+    ValueError otherwise."""
+    text = text.strip()
+    return datetime.fromisoformat(text) if len(text) > 10 else date.fromisoformat(text)
+
+
+def _utc(value: date) -> datetime:
+    """A `recent` range end: a date-time is an exact instant (UTC without a zone), a date
+    the start of that UTC day."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return datetime.combine(value, time(), tzinfo=UTC)
+
+
+def _cursor(
+    lo: datetime, hi: datetime, tags: list[str] | None, chat_ids: list[int] | None,
+    compact: bool, end_date: datetime, window_id: int,
+) -> str:  # fmt: skip
+    """The next page: the frozen range, filters and `compact`, and the last window's
+    position. Opaque to callers, who pass it back as it is."""
+    state = {"since": lo.isoformat(), "until": hi.isoformat(), "tags": tags,
+             "chat_ids": chat_ids, "compact": compact,
+             "end": end_date.astimezone(UTC).isoformat(), "window": window_id}  # fmt: skip
+    return base64.urlsafe_b64encode(json.dumps(state, separators=(",", ":")).encode()).decode()
+
+
+def _parse_cursor(
+    cursor: str,
+) -> tuple[datetime, datetime, list[str] | None, list[int] | None, bool, datetime, int]:
+    try:
+        state = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        if not isinstance(state, dict):
+            raise ValueError
+        moments = [datetime.fromisoformat(state[k]) for k in ("since", "until", "end")]
+        tags, chat_ids, window_id = state["tags"], state["chat_ids"], state["window"]
+        compact = state.get("compact", False)
+
+        def whole(value: object) -> bool:  # an int, not a bool
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        def listed(value: object, ok: Callable[[object], bool]) -> bool:
+            return value is None or isinstance(value, list) and all(map(ok, value))
+
+        if (
+            any(m.tzinfo is None for m in moments)
+            or not whole(window_id)
+            or not listed(tags, lambda t: isinstance(t, str))
+            or not listed(chat_ids, whole)
+            or not isinstance(compact, bool)
+        ):
+            raise ValueError
+        return moments[0], moments[1], tags, chat_ids, compact, moments[2], window_id
+    except (ValueError, TypeError, KeyError, binascii.Error, UnicodeDecodeError):
+        raise ValueError("cursor is not one this server returned") from None
+
+
+def recent(
+    conn: Conn,
+    *,
+    since: date | None = None,
+    until: date | None = None,
+    tags: list[str] | None = None,
+    chat_ids: list[int] | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+    now: datetime | None = None,
+    compact: bool = False,
+) -> Recent:
+    """Conversation windows with messages posted in `since` ≤ date < `until`, newest
+    activity first: no query, so "what's new" needs no topic. Unlike `search`, `until` is
+    exclusive (a date: up to the end of that UTC day) and defaults to `now`, so consecutive
+    ranges meet without gap or overlap and nothing posted after `now` is listed.
+
+    A hit keeps only its messages inside the range (`get_context` widens it); windows are
+    ordered by their last message, then id. `next_cursor` (set when the page was full)
+    carries the range, the filters and `compact`: with `cursor`, they come from it and
+    `since`, `until`, `tags`, `chat_ids` and `compact` are ignored. A page can hold fewer
+    than `limit` hits while more follow (a window overlapping the range with no message inside it is
+    skipped); only `next_cursor` None means the end. Paging runs over live data: a sync
+    that moves a window's last message can make it repeat or drop out between pages.
+    Messages a sync has stored but not yet put in a window, and tombstoned ones, are not
+    listed."""
+    if not 1 <= limit <= MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_LIMIT}")
+    now = now or datetime.now(UTC)
+    after: tuple[datetime, int] | None = None
+    if cursor is not None:
+        lo, hi, tags, chat_ids, compact, *position = _parse_cursor(cursor)
+        after = (cast(datetime, position[0]), cast(int, position[1]))
+    else:
+        if since is None:
+            raise ValueError("since is needed without a cursor")
+        lo = _utc(since)
+        hi = now if until is None else (
+            _utc(until) if isinstance(until, datetime) else _utc(until) + timedelta(days=1)
+        )  # fmt: skip
+    if lo >= hi:
+        raise BadRange("since is not before until")
+    chats = resolve_chats(conn, tags, chat_ids)
+    if chats == []:
+        return Recent(now, lo, hi, [], None)
+    filters = [sql.SQL("w.end_date >= %(lo)s"), sql.SQL("w.start_date < %(hi)s")]
+    params: dict[str, Any] = {"lo": lo, "hi": hi, "n": limit}
+    if chats is not None:
+        filters.append(sql.SQL("w.chat_id = ANY(%(chats)s)"))
+        params["chats"] = chats
+    if after is not None:
+        filters.append(sql.SQL("(w.end_date, w.window_id) < (%(c_date)s, %(c_id)s)"))
+        params["c_date"], params["c_id"] = after
+    # One query: the page of windows with each one's chat and live in-range messages, one
+    # row per message. The LEFT JOIN keeps a window with none of them as one row of nulls:
+    # no hit, but it counts towards the page and may be the cursor's position.
+    rows = conn.execute(
+        sql.SQL(
+            "WITH page AS (SELECT w.window_id, w.chat_id, w.end_date, w.message_ids"
+            ' FROM "window" w WHERE {} ORDER BY w.end_date DESC, w.window_id DESC'
+            " LIMIT %(n)s)"
+            " SELECT p.window_id, p.end_date, p.chat_id, c.title, c.kind, c.username,"
+            " coalesce((SELECT array_agg(t.tag ORDER BY t.tag) FROM chat_tag t"
+            " WHERE t.chat_id = c.chat_id AND t.status = 'confirmed'), '{{}}'),"
+            " m.message_id, m.server_message_id, m.sender_name, m.date, m.text"
+            " FROM page p JOIN chat c ON c.chat_id = p.chat_id"
+            " LEFT JOIN message m ON m.chat_id = p.chat_id"
+            " AND m.message_id = ANY(p.message_ids) AND m.deleted_at IS NULL"
+            " AND m.date >= %(lo)s AND m.date < %(hi)s"
+            " ORDER BY p.end_date DESC, p.window_id DESC, m.date, m.message_id"
+        ).format(sql.SQL(" AND ").join(filters)),
+        params,
+    ).fetchall()
+    hits, windows, last = [], 0, None
+    for _, group in groupby(rows, key=lambda r: r[0]):
+        window = list(group)
+        windows += 1
+        first = window[0]
+        last = (cast(datetime, first[1]), cast(int, first[0]))
+        if first[7] is None:  # no live message in the range
+            continue
+        chat_id, kind = cast(int, first[2]), cast(str, first[4])
+        username = cast(str | None, first[5])
+        messages = [
+            HitMessage(
+                message_id=cast(int, r[7]),
+                sender_name=cast(str | None, r[9]),
+                date=cast(datetime, r[10]).astimezone(UTC),
+                text=cast(str, r[11]),
+                link=link(kind, chat_id, username, cast(int, r[8])),
+            )
+            for r in window
+        ]
+        hit = Hit(
+            window_id=cast(int, first[0]),
+            chat_id=chat_id,
+            chat_title=cast(str, first[3]),
+            tags=cast(list[str], first[6]),
+            start_date=messages[0].date,
+            end_date=messages[-1].date,
+            score=0.0,
+            messages=messages,
+            highlights=[],
+        )
+        # compact: every in-range message, texts cut (a digest needs them all)
+        hits.append(compacted(hit, {m.message_id for m in messages}) if compact else hit)
+    next_cursor = None
+    if windows == limit and last is not None:
+        next_cursor = _cursor(lo, hi, tags, chat_ids, compact, *last)
+    log.info("recent windows=%s hits=%s more=%s", windows, len(hits), next_cursor is not None)
+    return Recent(now, lo, hi, hits, next_cursor)
 
 
 def _hit(

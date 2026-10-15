@@ -333,6 +333,8 @@ def test_flood_wait_past_the_deadline_ends_the_run_without_sleeping(
     assert 3600 not in clock.slept
     assert clock.mono < 60
     assert stored(conn, A) == list(range(51, 151))  # the first page is kept
+    # the sweep that the backfill reserve leaves time for does not ask before the wait ends
+    assert result.stats["requests"] == 2
 
 
 def test_request_spacing_past_the_deadline_ends_the_run_without_sleeping(

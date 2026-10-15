@@ -285,6 +285,11 @@ def test_hit_shape_maps_messages_to_their_window(archive: FakeTdClient, conn: Co
             },
         ],
         "highlights": [TEXTS[7]],
+        "matched_by": ["keyword", "trigram"],
+        "matched_message_ids": [7 << SHIFT],
+        "matched_queries": [0],
+        "semantic_distance": None,
+        "omitted_messages": 0,
     }
     assert (window[1], window[2]) == (hit.start_date, hit.end_date)
 

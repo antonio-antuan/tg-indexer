@@ -1,0 +1,14 @@
+# Every 3 hours on the UTC clock (SPEC §5.3; UTC, so `tgi status` and add_chat's estimates from
+# SYNC_EVERY_MINUTES line up), and at the next start when a run was missed (Persistent). For
+# fresher answers run it more often with a smaller budget, e.g. hourly (`OnCalendar=hourly`)
+# with SYNC_EVERY_MINUTES=60 and SYNC_MAX_MINUTES=50 in the .env (add_chat's estimates read both).
+
+[Unit]
+Description=tg-indexer sync every 3 hours
+
+[Timer]
+OnCalendar=*-*-* 00/3:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

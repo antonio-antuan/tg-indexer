@@ -148,7 +148,7 @@ def test_migration_0002_on_v1_database(create_database: Any, tmp_path: Path) -> 
             (A, 5 << 20),
         )
     with db.connect(url) as c:
-        assert db.migrate(c) == [2, 3]  # every pending migration, 0003 included
+        assert db.migrate(c) == [2, 3, 4]  # every pending migration, 0003 and 0004 included
         assert db.migrate(c) == []
     with psycopg.connect(url, autocommit=True) as c:
         col = c.execute(

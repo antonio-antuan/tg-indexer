@@ -16,6 +16,7 @@ import math
 import re
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from typing import Any, Protocol, cast
 
 import httpx
@@ -256,7 +257,10 @@ def embed_stale(
     should_stop: Callable[[], bool] = lambda: False,
     max_windows: int | None = None,
 ) -> dict[str, int]:
-    """Embed every `stale` window in batches of `BATCH`, in `window_id` order.
+    """Embed every `stale` window in batches of `BATCH`, newest first (by `end_date`, then
+    `window_id`), so with a backlog (a first import, a reindex, a provider outage) the latest
+    conversations become searchable by meaning before older history. Callers hold the sync
+    lock (`tgi sync`, `tgi embed`): a window rebuilt meanwhile could move across the cursor.
 
     `max_windows` caps the windows sent to the provider this call (embedded or failed).
     Returns `embedded`, `embed_failed` and `embed_stopped` (1 if `should_stop` ended the
@@ -265,21 +269,25 @@ def embed_stale(
     """
     counts = {"embedded": 0, "embed_failed": 0, "embed_stopped": 0}
     _check_model(conn, embedder)
-    after = 0  # keyset: failed windows stay stale and must not be fetched again
+    # keyset (end_date, window_id): failed windows stay stale and must not be fetched again.
+    # It starts at 'infinity', not NULL: an `IS NULL OR` would stop a cached generic plan
+    # from using the index range, and each batch would rescan from the newest window.
+    after: tuple[datetime | str, int] = ("infinity", 0)
     left = max_windows
     while left is None or left > 0:
         rows = conn.execute(
-            'SELECT window_id, text FROM "window" WHERE stale AND window_id > %s'
-            " ORDER BY window_id LIMIT %s",
-            (after, BATCH if left is None else min(BATCH, left)),
-        ).fetchall()
+            'SELECT window_id, text, end_date FROM "window" WHERE stale'
+            " AND (end_date, window_id) < (%(end)s::timestamptz, %(id)s)"
+            " ORDER BY end_date DESC, window_id DESC LIMIT %(n)s",
+            {"end": after[0], "id": after[1], "n": BATCH if left is None else min(BATCH, left)},
+        ).fetchall()  # fmt: skip
         if not rows:
             break
         if should_stop():
             counts["embed_stopped"] = 1
             break
         ids = [cast(int, r[0]) for r in rows]
-        after = ids[-1]
+        after = (cast(datetime, rows[-1][2]), ids[-1])
         if left is not None:
             left -= len(ids)
         try:

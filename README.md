@@ -51,14 +51,21 @@ command stops (exit 1) before it creates a client.
 `tgi` does not read `.env` itself, but every command warns on stderr when the `.env` in the
 current directory is more open than 0600 (the line names the file and its mode only).
 A TDLib error in `tgi chats list` or `tgi chats enable` exits 3 with the error type and
-code, as `sync` does.
+code, as `sync` does. Both use the account's TDLib session, which a running sync holds, so
+they connect to the database first, take the sync lock and exit 2 while a sync, `embed`,
+`purge` or `forget` runs. `tgi chats add` takes the same links as the MCP `add_chat` tool and
+refuses the same chats: a private chat, a basic group, a chat enabled under another account,
+a link that sends a join request (run it again once approved) or leads nowhere all exit 1
+with nothing enabled; it exits 2 while a sync (or `embed`, `purge`, `forget`) holds the lock,
+and 3 on another TDLib error or a flood wait.
 
 ## Sync
 
 ```sh
 uv run tgi chats list --account +34...             # the account's dialogs; * = enabled by it
 uv run tgi chats enable <chat_id> --account +34... [--years N]  # --years (1–100) is kept until changed; a larger value continues the backfill on the next sync; a smaller one deletes nothing
-uv run tgi sync [--max-minutes 150]                # catch-up, interleaved backfill, sweep
+uv run tgi chats add <link> --account +34... [--years N]  # join a supergroup or channel from a t.me link (or @name) and enable it, like the MCP add_chat
+uv run tgi sync [--max-minutes N]                  # catch-up, interleaved backfill, sweep; budget SYNC_MAX_MINUTES (150)
 uv run tgi sync --resweep-days N <chat_id>         # only that chat's sweep, N days deep
 uv run tgi chats disable <chat_id>                 # stop syncing, keep data
 uv run tgi chats forget <chat_id>                  # delete the chat's data (asks first)
@@ -74,6 +81,27 @@ error or a `--resweep-days` chat that is not in the archive, and 3 when the run 
 progress is checkpointed per page either way. A run killed before it could
 record its end leaves its row `running`; the next run marks it `interrupted`.
 
+The budget is shared out so a long history cannot starve the rest: catch-up (new messages)
+runs first with the whole budget, the backfill stops at 80% of it (`BACKFILL_RESERVE`), and the
+sweep, the window step and embedding get the rest: at least about a fifth of the budget, more
+when the backfill finishes early, less (or nothing) when catch-up itself runs long. A Telegram flood wait the
+backfill could not wait out is still honoured: the sweep waits for it within the budget or the
+run ends. A run whose backfill stopped there ends
+`time_limited` and continues the backfill next run. The budget is soft: the window step has no
+deadline and embedding checks it between batches. TDLib is closed before the run releases
+the lock, so a command waiting for the lock never meets a session that is still closing.
+
+### Running the sync on a timer
+
+`deploy/tgi-sync.service` and `deploy/tgi-sync.timer` are systemd user unit templates (the
+install commands are in the service's header): `tgi sync` every 3 hours, with the budget from
+`SYNC_MAX_MINUTES` (150), catching up a missed run at the next start. Exit 2 (the lock was held) counts as a skipped run,
+not a failure. Like the MCP unit they read `~/.config/tgi/.env`, where systemd expands neither
+`${…}` nor `~`: write `DATABASE_URL` with the password itself and absolute paths. For fresher
+answers run it more often with a smaller budget (the timer's header has an hourly example): set
+`SYNC_EVERY_MINUTES` and `SYNC_MAX_MINUTES` to match, which `add_chat`'s estimates read. `systemctl --user list-timers` shows the next run;
+`journalctl --user -u tgi-sync` the printed status and stats.
+
 The sweep re-pages the last `SWEEP_DAYS` (7) days of each chat: edits are applied, and
 messages missing from a fully paged range are tombstoned (`ON_DELETE=tombstone`, hidden
 from search) or deleted (`ON_DELETE=purge`). A sweep cut short deletes nothing, and so
@@ -86,11 +114,15 @@ messages changed, from the window holding the lowest changed message onward
 are marked `stale` for embedding. Window caps: `WINDOW_GAP_MIN` (30), `WINDOW_MAX_CHARS`
 (1500), `WINDOW_MAX_MSGS` (40).
 
-Then, within the same time budget, `stale` windows are embedded in batches of 64 with the
-`EMBED_PROVIDER`: `voyage` (the default; `VOYAGE_API_KEY`, `EMBED_MODEL` default
-`voyage-4`), `openai` (`OPENAI_API_KEY`, default `text-embedding-3-small`) or `fake`
+Then, within the same time budget, `stale` windows are embedded, newest first (so with a backlog,
+after a first import, a reindex or a provider outage, the latest conversations become searchable by
+meaning before older history), in batches of 64 with the
+`EMBED_PROVIDER`: `openai` (the default since SPEC v1.12; `OPENAI_API_KEY`, `EMBED_MODEL`
+default `text-embedding-3-small`), `voyage` (`VOYAGE_API_KEY`, default `voyage-4`) or `fake`
 (deterministic token-hash vectors, what the tests use), all 1024 dims. A missing or empty key is a usage error (exit 1,
-`VOYAGE_API_KEY is not set`) before anything runs. The HTTP providers use the environment's proxy and `SSL_CERT_FILE`
+e.g. `OPENAI_API_KEY is not set`) before anything runs. An archive embedded with Voyage under the old
+default keeps working only with `EMBED_PROVIDER=voyage` set explicitly; with OpenAI configured
+instead (and its key set), searches and syncs report `model_mismatch` until `tgi embed --reindex`. The HTTP providers use the environment's proxy and `SSL_CERT_FILE`
 settings; a 429 with `Retry-After` up to 30 s is waited out once, anything else fails the
 batch. `tgi embed --max-windows N` embeds at most N windows (a cheap first try with a paid
 provider) and prints the `tokens=` the provider billed. A
@@ -126,6 +158,13 @@ uv run tgi search "продление ВНЖ" "renovación TIE" [--json]   # sev
 uv run tgi search QUERY --mode hybrid|keyword|semantic        # default hybrid
 uv run tgi search QUERY --tag TAG --chat CHAT_ID --since 2026-01-01 --until 2026-03-31
 uv run tgi search QUERY --include-deleted --limit 50          # tombstoned messages too
+uv run tgi search QUERY --compact                             # matched messages and 2 neighbours, long texts cut
+uv run tgi recent [--hours 24 | --since … [--until …]] [--tag TAG] [--chat ID] [--json]  # what's new, no query
+uv run tgi status [--chat ID] [--json]                        # how current the archive is
+uv run tgi tags list [--json]                                 # tags with status and chat counts
+uv run tgi chats archived [--tag TAG] [--json]                # the archive's chats (not Telegram dialogs)
+uv run tgi context CHAT_ID MESSAGE [--before 10] [--after 10] [--json]  # MESSAGE: an id or its t.me link
+uv run tgi thread CHAT_ID MESSAGE [--limit 50] [--json]       # a reply chain and its replies
 uv run tgi tags propose|confirm|remove <chat_id> <tag>      # only confirmed tags filter
 ```
 
@@ -138,7 +177,52 @@ through the russian and english configs); a word that all three drop (`-a`) excl
 nothing. Matching messages are returned as their
 conversation windows, ranked by reciprocal-rank fusion across the queries, each message with
 a `t.me` link where Telegram has one (supergroups and channels; not basic groups or private
-chats). `--since`/`--until` are whole UTC days; `--tag` and `--chat` may be repeated.
+chats). `--since`/`--until` take a date, a whole UTC day, or an ISO date-time, an exact
+inclusive instant (UTC when it has no zone); `--tag` and `--chat` may be repeated.
+
+Every hit says how it was retrieved (not whether it is relevant): `matched_by` (`keyword`,
+`trigram`, `semantic`), `matched_message_ids` (the messages the keyword legs matched),
+`matched_queries` (0-based positions in the queries given, empty ones counted) and
+`semantic_distance` (the smallest cosine distance over the queries, lower is closer; null when
+the semantic leg did not find it). `--compact` (MCP
+`compact`) keeps each hit's matched messages and two neighbours each (the first five when only
+the semantic leg found it), cuts texts over 400 characters (marked `truncated`) and counts the
+rest in `omitted_messages`; for `tgi recent` it only cuts texts.
+
+Every MCP read tool has a CLI twin printing the same JSON with `--json`: `tgi search`
+(search), `tgi recent` (recent), `tgi status` (status), `tgi tags list` (list_tags), `tgi chats
+archived` (list_chats), `tgi context` (get_context) and `tgi thread` (get_thread), handy to check
+what an assistant was told. `MESSAGE` is a `message_id` as the tools return it, or the
+message's `t.me` link (`https://t.me/name/123`, `https://t.me/c/1234567890/123`): its last
+number is the server id, and the TDLib id is that times 2^20. A link must be the given chat's
+(its username, or its id without `-100`); another chat's link is `bad_argument`. Unknown tags or chats and other
+tool errors (`unknown_chat`, `bad_range`, …) exit 1 with their code, as the tools answer;
+the one difference is `tgi search` reporting an embedding failure or model mismatch as exit 3.
+
+`tgi status` shows how current the archive is: whether a sync (or `embed`, `purge`, `forget`, a join)
+runs now (`sync_lock_held`), the next scheduled run
+(an estimate from `SYNC_EVERY_MINUTES`), the last run (status, counts) and the last `ok` one (a
+whole sync or a one-chat resweep, so not proof that every chat is current), how many
+conversation windows wait for a new embedding (meaning-based search has none, or an outdated
+one, for them), and per chat: when its last sync turn ended (`last_sync_attempt_at`: complete, cut short or failed),
+whether its history is fetched back to its current lookback (`history_cutoff`; a deeper
+`--years` makes it incomplete at once), its oldest and newest stored message, whether stored messages still wait
+for the window step (a rebuild is pending: `recent` and meaning-based results may be incomplete
+or outdated; keyword search finds the stored messages), and its windows waiting for an embedding. No
+account phones are shown.
+
+`tgi recent` answers "what's new" without a topic: the conversation windows with messages
+posted in a time range, newest activity first (by each window's last message), each showing
+only its messages inside the range. The range is `--hours` back from now (default 24, at most
+744), or `--since` and optionally `--until`: `since` ≤ date < `until`. Unlike `search`, `--until`
+is exclusive (a date means up to the end of that UTC day) and defaults to now, so consecutive
+ranges meet without gap or overlap. Pages hold `--limit` windows (at most 50); when more follow
+it prints `more: tgi recent --cursor …` (with `--json`, `next_cursor`). The cursor keeps the
+range and filters, so `--cursor` alone continues (other options but `--limit` are ignored with
+it), and a short or even empty page can still have more. Paging runs over live data: a sync
+between pages can move a window, which then repeats or drops out. Messages a sync has stored but
+not yet put in a window (the window step runs at the end of every sync) and tombstoned messages
+are not listed.
 
 `--mode semantic` embeds each query with the `EMBED_PROVIDER` and takes the 100 nearest
 embedded windows (cosine) under the same tag, chat and date filters (a window counts when
@@ -162,13 +246,26 @@ uv run tgi mcp --http       # streamable HTTP at http://MCP_BIND/mcp, Bearer MCP
 uv run tgi mcp --stdio      # the same tools over stdin/stdout, for local debugging
 ```
 
-Seven tools (SPEC §5.6): `list_chats`, `list_tags`, `search` (as `tgi search --json`, `limit`
-≤ 50), `get_thread`, `get_context` (`before + after` ≤ 100, at most 100 messages with the message itself), `suggest_tags`, which only
+Nine tools (SPEC §5.6): `list_chats`, `list_tags`, `search` (as `tgi search --json`, `limit`
+≤ 50), `recent` (as `tgi recent --json`; `hours` or `since`/`until`, a `cursor` to page), `status`
+(as `tgi status --json`; optional `chat_ids`), `get_thread`, `get_context` (`before + after` ≤ 100, at most 100 messages with the message itself), `suggest_tags`, which only
 adds `proposed` tags (`proposed_by` `mcp`), and `add_chat`, which joins a supergroup or
 channel from a `t.me` link with `MCP_ACCOUNT` (default: the only logged-in account) and
 enables it; private chats and basic groups are refused, and during a `tgi sync` it answers
 `busy`. The server then needs the TDLib settings of `.env` (`DATA_DIR`, `TDLIB_DB_KEY`,
-`TG_API_ID`, `TG_API_HASH`) as well. A tool error's text is the SDK's prefix
+`TG_API_ID`, `TG_API_HASH`) as well.
+
+With `MCP_READ_ONLY=1` (also `true`, `yes`, `on`; unset, empty, `0`, `false`, `no`, `off` mean
+off, anything else is a usage error) the server offers only the seven read tools:
+`suggest_tags` and `add_chat` are not registered at all, a call to them gets `unknown_tool`,
+and the server never opens the Telegram account, so it needs no TDLib settings. Add chats with
+`tgi chats add` then. Every tool carries MCP annotations so a client can tell reads from
+writes: the read tools `readOnlyHint: true`, `suggest_tags` and `add_chat` `readOnlyHint:
+false` (`add_chat` also `openWorldHint: true`). A client can then run reads unattended and ask
+the user before a write; in Hermes that is `trust: untrusted` on the server. The annotations
+are hints for well-behaved clients; `MCP_READ_ONLY` is what the server enforces.
+
+A tool error's text is the SDK's prefix
 `Error executing tool <name>: ` followed by a JSON object `{"code": ..., "message": ...}`;
 `code` is `unknown_chat`, `unknown_tag`, `bad_range`, `bad_argument` (also a schema or type
 error, such as `limit: true`, or a value Postgres cannot store), `embedder_unavailable` or
@@ -233,3 +330,62 @@ other), otherwise `421`; an `Origin`, when sent, must be `http://` plus one of t
 `host.docker.internal`), so a client using an address, the Docker gateway's included, gets
 `421` until the address is in `MCP_ALLOWED_HOSTS`. Other names a client uses go in `MCP_ALLOWED_HOSTS` (comma-separated, no port).
 The rejected header value is not logged.
+
+### Connecting an assistant
+
+Any MCP client works; `docs/AGENT-NOTES.md` is the guidance to give the agent.
+
+- **Same machine, stdio** (no token, no network): the client starts the server and must load
+  `.env` itself, since `tgi` does not. For Claude Code:
+
+  ```sh
+  claude mcp add tgi -- bash -c 'cd ~/tg-indexer && set -a && . ./.env && set +a && exec .venv/bin/tgi mcp --stdio'
+  ```
+
+- **HTTP** (one long-running server, e.g. `deploy/tgi-mcp.service`, shared by several clients):
+  `http://<MCP_BIND>/mcp` with the header `Authorization: Bearer <MCP_TOKEN>`. For Claude Code:
+  `claude mcp add --transport http tgi http://127.0.0.1:8765/mcp --header "Authorization: Bearer $MCP_TOKEN"`.
+- **Hermes Agent** (`~/.hermes/config.yaml` or a profile's, the token in that profile's `.env`
+  as `TGI_MCP_TOKEN`). Seven read tools, plus `add_chat` behind an approval: `trust: untrusted`
+  makes Hermes ask before any tool without `readOnlyHint`, which here is only `add_chat`. Leave
+  `add_chat` out of `include` (or set `MCP_READ_ONLY=1` on the server) to give no write at all.
+
+  ```yaml
+  mcp_servers:
+    tgi:
+      url: "http://127.0.0.1:8765/mcp"
+      headers:
+        Authorization: "Bearer ${TGI_MCP_TOKEN}"
+      trust: untrusted
+      timeout: 120
+      tools:
+        include: [list_chats, list_tags, search, recent, status, get_thread, get_context, add_chat]
+        resources: false
+        prompts: false
+  ```
+
+  Select it with `--toolsets tgi`. Check that the client honours the annotations: Hermes
+  v0.21.5 (MCP SDK 2.0) does not read `readOnlyHint` and asks before every tool on an
+  `untrusted` server. With such a client use the default `trust`, leave `add_chat` out of
+  `include` and add chats with `tgi chats add`. Give a chat-facing assistant the tgi tools without a shell
+  where you can: a shell can read `.env` and the TDLib session, which MCP does not expose.
+
+## Operations
+
+- **Backups.** The archive is the Docker volume `pgdata`, not `DATA_DIR`. Back it up with
+  `docker compose exec -T db pg_dump -U tgi -Fc tgi > <private path>/tgi.dump` and test a
+  restore once into an empty database, e.g. `docker compose exec -T db createdb -U tgi
+  tgi_restore` then `docker compose exec -T db pg_restore -U tgi -d tgi_restore <
+  <private path>/tgi.dump`. The dump holds every archived message: keep
+  it private. `DATA_DIR/accounts` (the TDLib sessions) stays out of backups by design: after a
+  loss, log in again with `tgi accounts add`.
+- **Upgrades.** Stop the timer and the MCP service and wait for a running sync to end
+  (`tgi status --json`: `sync_lock_held` false; stopping the timer does not stop a run), pull,
+  `uv sync`, then `tgi db migrate`
+  (it never runs by itself; migration 0004 builds an index that blocks window writes while it
+  runs, so migrate while no sync runs), restart, and check `tgi status`.
+- **Another embedding model or provider** means `tgi embed --reindex`: every embedding is
+  deleted first (even with `--max-windows`) and every window embedded again, paid. Searches in
+  `hybrid` or `semantic` mode answer `model_mismatch` until then; `keyword` keeps working.
+- **Rotating `MCP_TOKEN`:** `tgi mcp token` prints a new value; put it in `.env` and in every
+  client (Hermes: the profile's `TGI_MCP_TOKEN`), then restart `tgi mcp --http`.

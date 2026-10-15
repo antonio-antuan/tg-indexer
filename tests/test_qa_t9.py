@@ -301,6 +301,11 @@ def test_cli_json_shape_exit_codes_and_no_text_in_logs(
         "score",
         "messages",
         "highlights",
+        "matched_by",
+        "matched_message_ids",
+        "matched_queries",
+        "semantic_distance",
+        "omitted_messages",
     ]
     assert list(h["messages"][0]) == ["message_id", "sender_name", "date", "text", "link"]
     assert (
