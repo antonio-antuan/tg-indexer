@@ -261,6 +261,41 @@ def test_a_page_of_windows_without_in_range_messages_is_empty_but_continues(
     assert search.recent(conn, cursor=page.next_cursor, now=NOW).next_cursor is None
 
 
+def test_tombstoned_messages_are_left_out_before_the_window_rebuild(
+    archive: None, conn: Conn
+) -> None:
+    # windows still list them until the next rebuild; B's window keeps its page slot
+    conn.execute(
+        "UPDATE message SET deleted_at = now() WHERE (chat_id, message_id) IN ((%s, %s), (%s, %s))",
+        (A, 7 << SHIFT, B, 2 << SHIFT),
+    )
+    answer = search.recent(conn, since=NOW - 24 * H, now=NOW)
+    assert ids(answer.hits) == [(C, [1]), (A, [8]), (A, [5, 6]), (A, [4])]
+    page = search.recent(conn, since=NOW - 24 * H, limit=3, now=NOW)
+    assert ids(page.hits) == [(C, [1]), (A, [8])] and page.next_cursor is not None
+    rest = search.recent(conn, cursor=page.next_cursor, now=NOW)
+    assert ids(rest.hits) == [(A, [5, 6]), (A, [4])]
+
+
+def test_a_page_takes_the_same_queries_however_many_hits(
+    archive: None, conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def queries(limit: int) -> int:
+        count, execute = 0, conn.execute
+
+        def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal count
+            count += 1
+            return execute(*args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(conn, "execute", counting)
+            search.recent(conn, since=NOW - 24 * H, limit=limit, now=NOW, compact=True)
+        return count
+
+    assert queries(1) == queries(len(DAY)) == 1
+
+
 def test_tied_end_dates_page_without_repeats(conn: Conn) -> None:
     td = FakeTdClient({"chats": [chat(A, [at(1, NOW - H)]), chat(B, [at(1, NOW - H)]),
                                  chat(C, [at(1, NOW - H)])], "runs": []})  # fmt: skip

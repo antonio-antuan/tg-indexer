@@ -5,7 +5,7 @@ import os
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -162,7 +162,9 @@ _CHAT_ID_ARGS = {"ignore_unknown_options": True}
 @app.command("sync", context_settings=_CHAT_ID_ARGS)
 def sync_command(
     chat_id: int | None = typer.Argument(None, help="The chat for --resweep-days."),
-    max_minutes: float = typer.Option(150, "--max-minutes", min=0, help="Run time budget."),
+    max_minutes: float | None = typer.Option(
+        None, "--max-minutes", min=0, help="Run time budget (default: SYNC_MAX_MINUTES, 150)."
+    ),
     resweep_days: int | None = typer.Option(
         None, "--resweep-days", min=1, help="Only re-run CHAT_ID's sweep over N days."
     ),
@@ -182,7 +184,8 @@ def sync_command(
         with db.connect(_database_url()) as conn:
             try:
                 result = ingest.sync(
-                    conn, clients, settings, max_minutes=max_minutes, resweep=resweep,
+                    conn, clients, settings, resweep=resweep,
+                    max_minutes=settings.sync_max_minutes if max_minutes is None else max_minutes,
                     embedder=embedder, close_clients=clients.close,
                 )  # fmt: skip
             except ingest.SyncLocked as exc:
@@ -627,59 +630,42 @@ def _when(value: str | None, name: str) -> date | None:
 def recent_command(
     tag: list[str] | None = _TAGS,
     chat: list[int] | None = _CHATS,
-    hours: int | None = typer.Option(
-        None, "--hours", min=1, max=search.MAX_RECENT_HOURS, help="Back from now (default 24)."
-    ),
+    hours: int | None = typer.Option(None, "--hours", help="Back from now (default 24)."),
     since: str | None = typer.Option(None, "--since", help="YYYY-MM-DD or ISO date-time (UTC)."),
     until: str | None = typer.Option(
         None, "--until", help="Exclusive end: YYYY-MM-DD (that whole day) or ISO date-time."
     ),
-    limit: int = typer.Option(20, "--limit", min=1, max=search.MAX_LIMIT),
+    limit: int = typer.Option(20, "--limit", help="Windows per page, 1 to 50."),
     cursor: str | None = typer.Option(None, "--cursor", help="next_cursor of a previous page."),
     as_json: bool = typer.Option(False, "--json", help="Print the answer as JSON."),
     compact: bool = typer.Option(False, "--compact", help="Cut long message texts."),
 ) -> None:
-    """What's new: windows with messages in a time range, newest first, no query.
+    """What's new: windows with messages in a time range, newest first, no query (the MCP
+    recent).
 
     --until is exclusive and defaults to now. --cursor continues a listing: it keeps the
     range and filters, so the other options but --limit are ignored with it."""
-    if cursor is None and hours is not None and since is not None:
-        raise _tool_exit("bad_argument", ValueError("give --hours or --since, not both"))
-    if cursor is None and until is not None and since is None:
-        raise _tool_exit("bad_argument", ValueError("--until needs --since"))
-    now = datetime.now(UTC)
-    if cursor is not None:  # the cursor carries the range: --since/--until are not read
-        since = until = None
-    start = None if cursor else _when(since, "--since") or now - timedelta(hours=hours or 24)
-    try:
-        with db.connect(_database_url()) as conn:
-            if cursor is None:  # the cursor's filters were checked when it was made
-                _check_filters(conn, tag, chat)
-            answer = search.recent(
-                conn,
-                since=start,
-                until=_when(until, "--until"),
-                tags=tag or None,
-                chat_ids=chat or None,
-                limit=limit,
-                cursor=cursor,
-                now=now,
-                compact=compact,
-            )
-    except search.BadRange as exc:
-        raise _tool_exit("bad_range", exc) from None
-    except ValueError as exc:  # a cursor this tool did not print
-        raise _tool_exit("bad_argument", exc) from None
+    with db.connect(_database_url()) as conn, _tool_errors():
+        answer = mcp_server.run_recent(
+            conn,
+            tags=tag,
+            chat_ids=chat,
+            hours=hours,
+            # the cursor carries the range: --since/--until are not even parsed
+            since=None if cursor else _when(since, "--since"),
+            until=None if cursor else _when(until, "--until"),
+            limit=limit,
+            cursor=cursor,
+            compact=compact,
+        )
     if as_json:
-        typer.echo(json.dumps(answer.as_dict(), ensure_ascii=False, indent=2))
+        typer.echo(json.dumps(answer, ensure_ascii=False, indent=2))
         return
-    for h in answer.hits:
-        typer.echo(f"{h.chat_title}  {h.start_date:%Y-%m-%d %H:%M}  (window {h.window_id})")
-        for m in h.messages:
-            typer.echo(f"  {m.date:%Y-%m-%d %H:%M} {m.sender_name or '?'}: {m.text}")
-            typer.echo(f"    {m.link or '(no link)'}")
-    if answer.next_cursor is not None:
-        typer.echo(f"more: tgi recent --cursor {answer.next_cursor}")
+    for h in answer["hits"]:
+        typer.echo(f"{h['chat_title']}  {h['start_date']}  (window {h['window_id']})")
+        _print_messages(h["messages"])
+    if answer["next_cursor"] is not None:
+        typer.echo(f"more: tgi recent --cursor {answer['next_cursor']}")
 
 
 @app.command("status")
@@ -888,6 +874,7 @@ def mcp_main(
         telegram=None if settings.mcp_read_only else _mcp_telegram(settings),
         default_years=settings.backfill_years,
         sync_every_minutes=settings.sync_every_minutes,
+        sync_max_minutes=settings.sync_max_minutes,
         read_only=settings.mcp_read_only,
     )
     if settings.mcp_read_only:

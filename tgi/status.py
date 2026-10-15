@@ -18,7 +18,8 @@ from tgi.ingest import SYNC_LOCK_KEY, Conn, deepened, years_before
 RUN_STATS = ("fetched", "upserted", "tombstoned", "windows_rebuilt", "embedded", "embed_failed")
 
 
-def _iso(value: object) -> str | None:
+def iso(value: object) -> str | None:
+    """ISO 8601 in UTC, as `Hit.as_dict` gives dates."""
     return None if value is None else cast(datetime, value).astimezone(UTC).isoformat()
 
 
@@ -44,8 +45,8 @@ def _run(row: tuple[object, ...] | None) -> dict[str, Any] | None:
     stats = cast(dict[str, int], row[4] or {})
     return {
         "run_id": row[0],
-        "started_at": _iso(row[1]),
-        "finished_at": _iso(row[2]),
+        "started_at": iso(row[1]),
+        "finished_at": iso(row[2]),
         "status": row[3],
         "stats": {k: stats[k] for k in RUN_STATS if k in stats},
         "error": row[5],
@@ -106,12 +107,12 @@ def status(
             "kind": r[2],
             "enabled": r[3],
             "tags": r[4],
-            "last_sync_attempt_at": _iso(r[5]),
+            "last_sync_attempt_at": iso(r[5]),
             "history_complete": complete,
             "history_cutoff": None if years is None else years_before(now, years).isoformat(),
             "backfill_years": years,
-            "oldest_message_at": _iso(r[10]),
-            "newest_message_at": _iso(r[11]),
+            "oldest_message_at": iso(r[10]),
+            "newest_message_at": iso(r[11]),
             "windows_need_rebuild": r[9],
             "windows_waiting_for_embedding": r[12],
         })  # fmt: skip

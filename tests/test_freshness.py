@@ -193,3 +193,31 @@ def test_a_failing_close_records_the_run_as_error(conn: Conn) -> None:
         ingest.sync(conn, lambda _: td, SETTINGS, FakeClock(), close_clients=close)
     row = conn.execute("SELECT status, stats->>'upserted' FROM sync_run").fetchone()
     assert row == ("error", "5")
+
+
+@pytest.mark.parametrize(
+    ("env", "args", "budget"),
+    [({}, [], 150), ({"SYNC_MAX_MINUTES": "50"}, [], 50),
+     ({"SYNC_MAX_MINUTES": "50"}, ["--max-minutes", "5"], 5)],
+)  # fmt: skip
+def test_cli_sync_budget_defaults_to_sync_max_minutes(
+    db_url: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    env: dict[str, str], args: list[str], budget: float,
+) -> None:  # fmt: skip
+    """The service runs plain `tgi sync`: SYNC_MAX_MINUTES, which add_chat's estimate also
+    reads, is the run's budget unless --max-minutes says otherwise."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("EMBED_PROVIDER", "fake")
+    monkeypatch.delenv("SYNC_MAX_MINUTES", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    budgets = []
+
+    def sync(*_: Any, max_minutes: float, **__: Any) -> None:
+        budgets.append(max_minutes)
+        raise ingest.SyncLocked("held")
+
+    monkeypatch.setattr(ingest, "sync", sync)
+    assert CliRunner().invoke(app, ["sync", *args]).exit_code == 2
+    assert budgets == [budget]

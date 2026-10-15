@@ -81,6 +81,12 @@ def _sync_every(minutes: int) -> int:
     return minutes
 
 
+def _sync_max(minutes: int) -> int:
+    if not 1 <= minutes <= MAX_SYNC_EVERY_MINUTES:
+        raise ValueError(f"SYNC_MAX_MINUTES must be between 1 and {MAX_SYNC_EVERY_MINUTES}")
+    return minutes
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str | None = field(default=None, repr=False)
@@ -106,6 +112,9 @@ class Settings:
     mcp_account: str | None = None  # the account `add_chat` joins with; None: the only one
     mcp_read_only: bool = False  # MCP_READ_ONLY: serve only the tools that read
     sync_every_minutes: int = 0  # the host's sync schedule, for `add_chat` estimates; 0: none
+    # `tgi sync`'s budget without --max-minutes (ingest.DEFAULT_MAX_MINUTES), and the run
+    # length `add_chat` estimates with
+    sync_max_minutes: int = 150
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -142,4 +151,5 @@ class Settings:
             mcp_account=_str(env, "MCP_ACCOUNT"),
             mcp_read_only=_bool(env, "MCP_READ_ONLY"),
             sync_every_minutes=_sync_every(_int(env, "SYNC_EVERY_MINUTES", 0)),
+            sync_max_minutes=_sync_max(_int(env, "SYNC_MAX_MINUTES", 150)),
         )

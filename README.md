@@ -65,7 +65,7 @@ and 3 on another TDLib error or a flood wait.
 uv run tgi chats list --account +34...             # the account's dialogs; * = enabled by it
 uv run tgi chats enable <chat_id> --account +34... [--years N]  # --years (1–100) is kept until changed; a larger value continues the backfill on the next sync; a smaller one deletes nothing
 uv run tgi chats add <link> --account +34... [--years N]  # join a supergroup or channel from a t.me link (or @name) and enable it, like the MCP add_chat
-uv run tgi sync [--max-minutes 150]                # catch-up, interleaved backfill, sweep
+uv run tgi sync [--max-minutes N]                  # catch-up, interleaved backfill, sweep; budget SYNC_MAX_MINUTES (150)
 uv run tgi sync --resweep-days N <chat_id>         # only that chat's sweep, N days deep
 uv run tgi chats disable <chat_id>                 # stop syncing, keep data
 uv run tgi chats forget <chat_id>                  # delete the chat's data (asks first)
@@ -94,12 +94,12 @@ the lock, so a command waiting for the lock never meets a session that is still 
 ### Running the sync on a timer
 
 `deploy/tgi-sync.service` and `deploy/tgi-sync.timer` are systemd user unit templates (the
-install commands are in the service's header): `tgi sync --max-minutes 150` every 3 hours,
-catching up a missed run at the next start. Exit 2 (the lock was held) counts as a skipped run,
+install commands are in the service's header): `tgi sync` every 3 hours, with the budget from
+`SYNC_MAX_MINUTES` (150), catching up a missed run at the next start. Exit 2 (the lock was held) counts as a skipped run,
 not a failure. Like the MCP unit they read `~/.config/tgi/.env`, where systemd expands neither
 `${…}` nor `~`: write `DATABASE_URL` with the password itself and absolute paths. For fresher
-answers run it more often with a smaller budget (the timer's header has an hourly example) and
-set `SYNC_EVERY_MINUTES` to match. `systemctl --user list-timers` shows the next run;
+answers run it more often with a smaller budget (the timer's header has an hourly example): set
+`SYNC_EVERY_MINUTES` and `SYNC_MAX_MINUTES` to match, which `add_chat`'s estimates read. `systemctl --user list-timers` shows the next run;
 `journalctl --user -u tgi-sync` the printed status and stats.
 
 The sweep re-pages the last `SWEEP_DAYS` (7) days of each chat: edits are applied, and

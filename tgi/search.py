@@ -27,6 +27,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
+from itertools import groupby
 from typing import Any, Literal, cast
 
 from psycopg import sql
@@ -690,29 +691,63 @@ def recent(
     if after is not None:
         filters.append(sql.SQL("(w.end_date, w.window_id) < (%(c_date)s, %(c_id)s)"))
         params["c_date"], params["c_id"] = after
+    # One query: the page of windows with each one's chat and live in-range messages, one
+    # row per message. The LEFT JOIN keeps a window with none of them as one row of nulls:
+    # no hit, but it counts towards the page and may be the cursor's position.
     rows = conn.execute(
         sql.SQL(
-            'SELECT w.window_id, w.end_date FROM "window" w WHERE {}'
-            " ORDER BY w.end_date DESC, w.window_id DESC LIMIT %(n)s"
+            "WITH page AS (SELECT w.window_id, w.chat_id, w.end_date, w.message_ids"
+            ' FROM "window" w WHERE {} ORDER BY w.end_date DESC, w.window_id DESC'
+            " LIMIT %(n)s)"
+            " SELECT p.window_id, p.end_date, p.chat_id, c.title, c.kind, c.username,"
+            " coalesce((SELECT array_agg(t.tag ORDER BY t.tag) FROM chat_tag t"
+            " WHERE t.chat_id = c.chat_id AND t.status = 'confirmed'), '{{}}'),"
+            " m.message_id, m.server_message_id, m.sender_name, m.date, m.text"
+            " FROM page p JOIN chat c ON c.chat_id = p.chat_id"
+            " LEFT JOIN message m ON m.chat_id = p.chat_id"
+            " AND m.message_id = ANY(p.message_ids) AND m.deleted_at IS NULL"
+            " AND m.date >= %(lo)s AND m.date < %(hi)s"
+            " ORDER BY p.end_date DESC, p.window_id DESC, m.date, m.message_id"
         ).format(sql.SQL(" AND ").join(filters)),
         params,
     ).fetchall()
-    hits = []
-    for row in rows:
-        hit = _hit(conn, ("w", row[0]), 0.0, [], [], include_deleted=False)
-        if hit is None:
+    hits, windows, last = [], 0, None
+    for _, group in groupby(rows, key=lambda r: r[0]):
+        window = list(group)
+        windows += 1
+        first = window[0]
+        last = (cast(datetime, first[1]), cast(int, first[0]))
+        if first[7] is None:  # no live message in the range
             continue
-        inside = [m for m in hit.messages if lo <= m.date < hi]
-        if inside:
-            hit = replace(hit, messages=inside, start_date=inside[0].date,
-                          end_date=inside[-1].date)  # fmt: skip
-            # compact: every in-range message, texts cut (a digest needs them all)
-            hits.append(compacted(hit, {m.message_id for m in inside}) if compact else hit)
+        chat_id, kind = cast(int, first[2]), cast(str, first[4])
+        username = cast(str | None, first[5])
+        messages = [
+            HitMessage(
+                message_id=cast(int, r[7]),
+                sender_name=cast(str | None, r[9]),
+                date=cast(datetime, r[10]).astimezone(UTC),
+                text=cast(str, r[11]),
+                link=link(kind, chat_id, username, cast(int, r[8])),
+            )
+            for r in window
+        ]
+        hit = Hit(
+            window_id=cast(int, first[0]),
+            chat_id=chat_id,
+            chat_title=cast(str, first[3]),
+            tags=cast(list[str], first[6]),
+            start_date=messages[0].date,
+            end_date=messages[-1].date,
+            score=0.0,
+            messages=messages,
+            highlights=[],
+        )
+        # compact: every in-range message, texts cut (a digest needs them all)
+        hits.append(compacted(hit, {m.message_id for m in messages}) if compact else hit)
     next_cursor = None
-    if len(rows) == limit:
-        last_id, last_end = cast(int, rows[-1][0]), cast(datetime, rows[-1][1])
-        next_cursor = _cursor(lo, hi, tags, chat_ids, compact, last_end, last_id)
-    log.info("recent windows=%s hits=%s more=%s", len(rows), len(hits), next_cursor is not None)
+    if windows == limit and last is not None:
+        next_cursor = _cursor(lo, hi, tags, chat_ids, compact, *last)
+    log.info("recent windows=%s hits=%s more=%s", windows, len(hits), next_cursor is not None)
     return Recent(now, lo, hi, hits, next_cursor)
 
 

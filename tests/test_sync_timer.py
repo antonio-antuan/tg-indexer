@@ -27,7 +27,7 @@ def test_the_service_runs_one_budgeted_sync_and_a_held_lock_is_no_failure() -> N
     service, timer = units()
     s = service["Service"]
     assert s["Type"] == "oneshot"
-    assert s["ExecStart"].endswith("/.venv/bin/tgi sync --max-minutes 150")
+    assert s["ExecStart"].endswith("/.venv/bin/tgi sync")  # budget: SYNC_MAX_MINUTES
     assert s["EnvironmentFile"] == "%h/.config/tgi/.env"
     assert s["SuccessExitStatus"] == "2"  # SPEC §5.3: exit 2 = another run holds the lock
     assert int(s["TimeoutStartSec"].removesuffix("min")) > 150  # the budget is soft

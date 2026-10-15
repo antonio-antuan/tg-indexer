@@ -141,8 +141,8 @@ def list_chats(conn: Conn, tag: str | None = None) -> list[dict[str, Any]]:
             "kind": r[2],
             "tags": r[3],
             "message_count": r[4],
-            "first_date": _iso(r[5]),
-            "last_date": _iso(r[6]),
+            "first_date": status.iso(r[5]),
+            "last_date": status.iso(r[6]),
         }
         for r in rows
     ]
@@ -270,7 +270,7 @@ def _messages(conn: Conn, chat_id: int, ids: list[int]) -> list[dict[str, Any]]:
         {
             "message_id": r[0],
             "sender_name": r[1],
-            "date": _iso(r[2]),
+            "date": status.iso(r[2]),
             "text": r[3],
             "link": search.link(kind, chat_id, username, cast(int, r[4])),
         }
@@ -464,6 +464,7 @@ def add_chat(
     default_years: int,
     sync_every_minutes: int = 0,
     now: datetime | None = None,
+    sync_max_minutes: int = Settings.sync_max_minutes,
 ) -> dict[str, Any]:
     """The MCP `add_chat` tool: `join_chat`, with its failures as tool error codes and the
     result's `sync` block estimating when the chat is searchable (`tgi.eta`)."""
@@ -500,19 +501,13 @@ def add_chat(
     log.info("add_chat: enabled chat %s (%s)", chat.chat_id, chat.kind)
     try:
         when = eta.estimate(conn, chat.chat_id, joined.sample, now or datetime.now(UTC),
-                            joined.depth.years, sync_every_minutes,
-                            ingest.DEFAULT_MAX_MINUTES)  # fmt: skip
+                            joined.depth.years, sync_every_minutes, sync_max_minutes)  # fmt: skip
     except Exception as exc:  # the chat is enabled: an estimate failure must not hide that
         log.warning("add_chat: no estimate for chat %s (%s)", chat.chat_id, type(exc).__name__)
         when = eta.UNKNOWN
     return {"chat_id": chat.chat_id, "title": chat.title, "kind": chat.kind,
             "username": chat.username, "backfill_years": joined.depth.years,
             "sync": when.as_dict()}  # fmt: skip
-
-
-def _iso(value: object) -> str | None:
-    """ISO 8601 in UTC, as `Hit.as_dict` gives dates."""
-    return None if value is None else cast(datetime, value).astimezone(UTC).isoformat()
 
 
 # --- the server -------------------------------------------------------------------------------
@@ -562,12 +557,14 @@ def build_server(
     default_years: int = Settings.backfill_years,
     sync_every_minutes: int = 0,
     read_only: bool = False,
+    sync_max_minutes: int = Settings.sync_max_minutes,
 ) -> MCPServer:
     """The nine tools, or with `read_only` (`MCP_READ_ONLY`) the seven that only read:
     `suggest_tags` and `add_chat` are then not registered at all, whatever a client asks.
     `embedder` replaces the configured provider (tests); `telegram` opens the account
     `add_chat` joins with (none: the tool answers `not_configured`); `default_years` is
-    `BACKFILL_YEARS`; `sync_every_minutes` is `SYNC_EVERY_MINUTES`."""
+    `BACKFILL_YEARS`; `sync_every_minutes` and `sync_max_minutes` are `SYNC_EVERY_MINUTES`
+    and `SYNC_MAX_MINUTES`."""
     server = _Server(
         "tgi",
         instructions="Search a personal Telegram archive (read-only)."
@@ -708,7 +705,15 @@ def build_server(
         `estimated_messages`, `estimated_minutes`; UTC, rough, null when no schedule is
         configured. Tell the user these times."""
         return connected(
-            lambda conn: add_chat(conn, telegram, link, years, default_years, sync_every_minutes)
+            lambda conn: add_chat(
+                conn,
+                telegram,
+                link,
+                years,
+                default_years,
+                sync_every_minutes,
+                sync_max_minutes=sync_max_minutes,
+            )  # fmt: skip
         )
 
     return server

@@ -269,16 +269,17 @@ def embed_stale(
     """
     counts = {"embedded": 0, "embed_failed": 0, "embed_stopped": 0}
     _check_model(conn, embedder)
-    # keyset (end_date, window_id): failed windows stay stale and must not be fetched again
-    after: tuple[datetime, int] | None = None
+    # keyset (end_date, window_id): failed windows stay stale and must not be fetched again.
+    # It starts at 'infinity', not NULL: an `IS NULL OR` would stop a cached generic plan
+    # from using the index range, and each batch would rescan from the newest window.
+    after: tuple[datetime | str, int] = ("infinity", 0)
     left = max_windows
     while left is None or left > 0:
         rows = conn.execute(
             'SELECT window_id, text, end_date FROM "window" WHERE stale'
-            " AND (%(end)s::timestamptz IS NULL OR (end_date, window_id) < (%(end)s, %(id)s))"
+            " AND (end_date, window_id) < (%(end)s::timestamptz, %(id)s)"
             " ORDER BY end_date DESC, window_id DESC LIMIT %(n)s",
-            {"end": after[0] if after else None, "id": after[1] if after else None,
-             "n": BATCH if left is None else min(BATCH, left)},
+            {"end": after[0], "id": after[1], "n": BATCH if left is None else min(BATCH, left)},
         ).fetchall()  # fmt: skip
         if not rows:
             break

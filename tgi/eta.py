@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
-from tgi.ingest import Conn, years_before
+from tgi.ingest import BACKFILL_RESERVE, Conn, years_before
 from tgi.td_port import SERVER_ID_SHIFT, Message
 
 # Messages per minute when no past run says otherwise (the first full run did ~4000).
@@ -111,7 +111,8 @@ def estimate(
 ) -> Eta:
     """When the chat's messages are searchable: first the newest (catch-up comes first in a
     run), all of them once its share of the runs' backfill rounds has fetched the lookback.
-    A run stops at `run_minutes`; the next one starts at the following schedule tick.
+    A run stops at `run_minutes` (`SYNC_MAX_MINUTES`), its backfill at `BACKFILL_RESERVE`
+    short of that; the next run starts at the following schedule tick.
     `sample` None (the history could not be read) leaves the volume and the end unknown:
     an unread chat is not an empty one."""
     start = next_run(now, every_minutes)
@@ -123,9 +124,11 @@ def estimate(
     minutes = math.ceil(messages / rate) if messages else 0
     if start is None or first is None:
         return Eta(None, messages, minutes, None, None)
-    end, left = start, float(minutes)
-    while left > run_minutes:  # a run uses its whole budget, then waits for the next tick
-        left -= run_minutes
+    # whole seconds: subtracting a fractional share again and again drifts into an extra run
+    backfill_seconds = max(round(run_minutes * 60 * (1 - BACKFILL_RESERVE)), 1)
+    end, left = start, minutes * 60
+    while left > backfill_seconds:  # a run uses its whole budget, then waits for the next tick
+        left -= backfill_seconds
         end = cast(datetime, next_run(end + timedelta(minutes=run_minutes), every_minutes))
-    end += timedelta(minutes=max(left, FIRST_RESULTS_MIN))
+    end += timedelta(seconds=max(left, FIRST_RESULTS_MIN * 60))
     return Eta(start, messages, minutes, first, end)

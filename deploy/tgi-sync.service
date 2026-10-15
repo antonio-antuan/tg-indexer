@@ -16,8 +16,10 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=%h/tg-indexer
 EnvironmentFile=%h/.config/tgi/.env
-# The budget is soft (the window and embed steps finish their batch): stop well after it.
-ExecStart=%h/tg-indexer/.venv/bin/tgi sync --max-minutes 150
+# The budget is SYNC_MAX_MINUTES (default 150), which add_chat's estimates read too. It is soft
+# (the window and embed steps finish their batch): stop well after it, and raise this timeout
+# if you raise the budget.
+ExecStart=%h/tg-indexer/.venv/bin/tgi sync
 TimeoutStartSec=170min
 SuccessExitStatus=2
 NoNewPrivileges=yes
